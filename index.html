@@ -1,0 +1,1275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L10 Meeting Runner</title>
+<!-- Teams JS SDK -->
+<script src="https://res.cdn.office.net/teams-js/2.24.0/js/MicrosoftTeams.min.js"></script>
+<!-- MSAL Browser -->
+<script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
+<!-- React 17 (matches SPFx 1.18.2) -->
+<script crossorigin src="https://unpkg.com/react@17/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@17/umd/react-dom.production.min.js"></script>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{font-family:'Segoe UI',-apple-system,BlinkMacSystemFont,sans-serif;background:#f4f5f7;}
+  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap');
+  @keyframes ndlpulse{0%,100%{box-shadow:0 0 0 0 rgba(220,38,38,.5)}50%{box-shadow:0 0 0 10px rgba(220,38,38,0)}}
+  .ndl-ot{animation:ndlpulse 1.2s infinite;border-radius:8px;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  CONFIGURATION — Update these values for your environment                   ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+var CONFIG = {
+  // Azure AD App Registration — register at https://entra.microsoft.com
+  // See SETUP.md for step-by-step instructions
+  clientId: '72107559-538e-488e-985c-a62494837195',  // Application (client) ID
+  tenantId: '5e8309ee-c8d0-4bc7-b5b8-5a37a4eb107b',  // Directory (tenant) ID
+
+  // SharePoint site
+  siteUrl: 'https://ndlhearthnh.sharepoint.com/sites/NDLHub',
+
+  // SharePoint list names
+  lists: {
+    attendees:        'L10 Attendees',
+    scorecardMetrics: 'Scorecard Metrics',
+    scorecardData:    'Scorecard Data',
+    rocks:            'Rocks',
+    milestones:       'Milestones',
+    issues:           'Issues List',
+    todos:            'ToDos'
+  },
+
+  // Available meetings
+  meetings: [
+    'NDL - Leadership L10',
+    'NDL - Sales & Marketing L10',
+    'NDL - Tech L10',
+    'NDL - Office L10',
+    'NDL - Purchasing L10',
+    'NDL - Warehouse L10'
+  ],
+
+  // Default durations (minutes)
+  defaultDurations: {
+    segue: 5, scorecard: 5, news: 5, rocks: 5, todos: 5, ids: 60, conclude: 5
+  },
+
+  // Power Automate flow URL for meeting recap email (optional)
+  flowUrl: '',
+
+  // Current quarter (for rock filtering)
+  quarter: 'Q2 2026'
+};
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  AUTH — MSAL setup                                                          ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+var msalInstance = null;
+var currentAccount = null;
+
+var msalConfig = {
+  auth: {
+    clientId: CONFIG.clientId,
+    authority: 'https://login.microsoftonline.com/' + CONFIG.tenantId,
+    redirectUri: 'https://kevink4056837.github.io/ndl-l10-runner/index.html'
+  },
+  cache: { cacheLocation: 'sessionStorage', storeAuthStateInCookie: true }
+};
+
+async function initAuth() {
+  msalInstance = new msal.PublicClientApplication(msalConfig);
+  await msalInstance.initialize();
+
+  // Handle redirect response (if returning from auth redirect)
+  var resp = await msalInstance.handleRedirectPromise();
+  if (resp) currentAccount = resp.account;
+
+  // Check for existing accounts
+  var accounts = msalInstance.getAllAccounts();
+  if (accounts.length > 0) currentAccount = accounts[0];
+
+  return currentAccount;
+}
+
+async function getToken() {
+  var tokenRequest = {
+    scopes: [CONFIG.siteUrl + '/.default'],
+    account: currentAccount
+  };
+  try {
+    var resp = await msalInstance.acquireTokenSilent(tokenRequest);
+    return resp.accessToken;
+  } catch (e) {
+    // Silent failed — try popup
+    try {
+      var resp = await msalInstance.acquireTokenPopup(tokenRequest);
+      currentAccount = resp.account;
+      return resp.accessToken;
+    } catch (e2) {
+      console.error('Auth failed:', e2);
+      throw e2;
+    }
+  }
+}
+
+async function login() {
+  try {
+    var resp = await msalInstance.loginPopup({
+      scopes: [CONFIG.siteUrl + '/.default']
+    });
+    currentAccount = resp.account;
+    return currentAccount;
+  } catch (e) {
+    console.error('Login failed:', e);
+    throw e;
+  }
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  SHAREPOINT API HELPER                                                      ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+async function spGet(url) {
+  var token = await getToken();
+  var resp = await fetch(url, {
+    headers: {
+      'Accept': 'application/json;odata=nometadata',
+      'Authorization': 'Bearer ' + token
+    }
+  });
+  if (!resp.ok) throw new Error('SP GET failed: ' + resp.status);
+  var data = await resp.json();
+  return data.value || [];
+}
+
+async function spPost(url, body) {
+  var token = await getToken();
+  var resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json;odata=nometadata',
+      'Content-Type': 'application/json;odata=verbose',
+      'Authorization': 'Bearer ' + token
+    },
+    body: JSON.stringify(body)
+  });
+  if (!resp.ok) throw new Error('SP POST failed: ' + resp.status);
+  return await resp.json();
+}
+
+async function spPatch(url, body) {
+  var token = await getToken();
+  var resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json;odata=nometadata',
+      'Content-Type': 'application/json;odata=verbose',
+      'Authorization': 'Bearer ' + token,
+      'IF-MATCH': '*',
+      'X-HTTP-Method': 'MERGE'
+    },
+    body: JSON.stringify(body)
+  });
+  if (!resp.ok) throw new Error('SP PATCH failed: ' + resp.status);
+}
+
+async function spDelete(url) {
+  var token = await getToken();
+  var resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json;odata=nometadata',
+      'Authorization': 'Bearer ' + token,
+      'IF-MATCH': '*',
+      'X-HTTP-Method': 'DELETE'
+    }
+  });
+  if (!resp.ok) throw new Error('SP DELETE failed: ' + resp.status);
+}
+
+async function spGetCurrentUser() {
+  var token = await getToken();
+  var resp = await fetch(CONFIG.siteUrl + '/_api/web/currentuser', {
+    headers: {
+      'Accept': 'application/json;odata=nometadata',
+      'Authorization': 'Bearer ' + token
+    }
+  });
+  return await resp.json();
+}
+
+async function spSearchPeople(query) {
+  var token = await getToken();
+  var resp = await fetch(CONFIG.siteUrl + '/_api/SP.UI.ApplicationPages.ClientPeoplePickerWebServiceInterface.clientPeoplePickerSearchUser', {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json;odata=nometadata',
+      'Content-Type': 'application/json;odata=verbose',
+      'Authorization': 'Bearer ' + token
+    },
+    body: JSON.stringify({
+      queryParams: {
+        __metadata: { type: 'SP.UI.ApplicationPages.ClientPeoplePickerQueryParameters' },
+        AllowEmailAddresses: false, AllowMultipleEntities: false,
+        AllUrlZones: false, MaximumEntitySuggestions: 8,
+        PrincipalSource: 15, PrincipalType: 1, QueryString: query
+      }
+    })
+  });
+  var data = await resp.json();
+  return JSON.parse(data.value || '[]');
+}
+
+async function spEnsureUser(loginName) {
+  var token = await getToken();
+  var resp = await fetch(CONFIG.siteUrl + "/_api/web/ensureuser('" + encodeURIComponent(loginName) + "')", {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json;odata=nometadata',
+      'Content-Type': 'application/json;odata=verbose',
+      'Authorization': 'Bearer ' + token
+    },
+    body: JSON.stringify({ __metadata: { type: 'SP.User' } })
+  });
+  return await resp.json();
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  TEAMS SDK                                                                  ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+var inTeams = false;
+var teamsContext = null;
+
+async function initTeams() {
+  try {
+    await microsoftTeams.app.initialize();
+    inTeams = true;
+    teamsContext = await microsoftTeams.app.getContext();
+
+    // If we're in the config frame, register the save handler
+    if (teamsContext.page && teamsContext.page.frameContext === 'settings') {
+      microsoftTeams.pages.config.registerOnSaveHandler(function(saveEvent) {
+        microsoftTeams.pages.config.setConfig({
+          suggestedDisplayName: 'L10 Runner',
+          entityId: 'ndl-l10-runner',
+          contentUrl: window.location.origin + window.location.pathname,
+          websiteUrl: CONFIG.siteUrl
+        });
+        saveEvent.notifySuccess();
+      });
+      microsoftTeams.pages.config.setValidityState(true);
+    }
+
+    return teamsContext;
+  } catch (e) {
+    // Not running inside Teams — that's fine
+    inTeams = false;
+    return null;
+  }
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  HELPERS                                                                    ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+var OWNER_COLORS = {
+  'JK':'#e8a87c','MS':'#7ec8a8','RB':'#8ab4e8','TW':'#c8a8e8','JS':'#f0b87a',
+  'KK':'#a8c8e8','AV':'#f0c4d4','DK':'#a8d8c8','BT':'#d4b8e8','CH':'#f4a4b4',
+  'MY':'#b4d4f4','PW':'#c4e8c4','default':'#94a3b8'
+};
+var SECTIONS = [
+  { id: 'segue',     label: 'Segue',        icon: '\uD83D\uDC4B' },
+  { id: 'scorecard', label: 'Scorecard',     icon: '\uD83D\uDCCA' },
+  { id: 'news',      label: 'Industry News', icon: '\uD83D\uDCF0' },
+  { id: 'rocks',     label: 'Rock Review',   icon: '\uD83D\uDC8E' },
+  { id: 'todos',     label: 'To-Do Review',  icon: '\u2705' },
+  { id: 'ids',       label: 'IDS',           icon: '\uD83C\uDFAF' },
+  { id: 'conclude',  label: 'Conclude',      icon: '\uD83C\uDFC1' }
+];
+var ROCK_STATUS = {
+  'On Track':  { bg:'#d1fae5', color:'#065f46', border:'#6ee7b7' },
+  'Off Track': { bg:'#fee2e2', color:'#991b1b', border:'#fca5a5' },
+  'Blocked':   { bg:'#fef3c7', color:'#92400e', border:'#fcd34d' },
+  'Complete':  { bg:'#e0f2fe', color:'#0c4a6e', border:'#7dd3fc' },
+  'Dropped':   { bg:'#f3f4f6', color:'#6b7280', border:'#d1d5db' }
+};
+
+function gi(n) { return (n || '??').split(' ').map(function(x){ return x[0]; }).join('').toUpperCase().slice(0,2); }
+function oc(i) { return OWNER_COLORS[i] || OWNER_COLORS['default']; }
+function fmtSecs(s) { var a = Math.abs(s); return (s < 0 ? '-' : '') + Math.floor(a/60) + ':' + (a%60).toString().padStart(2,'0'); }
+function fmtDate(iso) { if (!iso) return ''; return new Date(iso+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'}); }
+function isOverdue(d) { return !!d && new Date(d+'T12:00:00') < new Date(new Date().toISOString().split('T')[0]+'T12:00:00'); }
+function todayISO() { return new Date().toISOString().split('T')[0]; }
+function defaultDue() { var d = new Date(); d.setDate(d.getDate()+7); return d.toISOString().split('T')[0]; }
+
+function fmtVal(value, unit) {
+  if (unit === 'dollar') {
+    var abs = Math.abs(value);
+    if (abs >= 1000000) return (value<0?'-':'') + '$' + (abs/1000000).toFixed(2) + 'M';
+    if (abs >= 1000) return (value<0?'-':'') + '$' + (abs/1000).toFixed(1) + 'K';
+    return (value<0?'-':'') + '$' + abs.toFixed(2);
+  }
+  if (unit === 'percent') return value + '%';
+  return String(value);
+}
+
+var h = React.createElement; // shorthand
+
+function sparkline(vals, w, ht) {
+  w = w || 60; ht = ht || 20;
+  if (!vals || vals.length < 2) return h('span',{style:{color:'#e5e7eb',fontSize:11}},'\u2014');
+  var reversed = vals.slice().reverse();
+  var nums = reversed.map(function(v){ return v.value; });
+  var min = Math.min.apply(null,nums), max = Math.max.apply(null,nums);
+  var range = max - min || 1;
+  var pts = nums.map(function(v,i){ return Math.round(i*(w/(nums.length-1))||0)+','+Math.round(ht-((v-min)/range)*ht); }).join(' ');
+  var lastOn = reversed[reversed.length-1] && reversed[reversed.length-1].onTrack === 'Yes';
+  return h('svg',{viewBox:'0 0 '+w+' '+ht,style:{width:w,height:ht,display:'block'}},
+    h('polyline',{points:pts,fill:'none',stroke:lastOn?'#10b981':'#ef4444',strokeWidth:'1.5',strokeLinejoin:'round',strokeLinecap:'round'})
+  );
+}
+
+// Avatar component
+function Av(props) {
+  var name = props.name, size = props.size || 26, email = props.email;
+  var initials = gi(name);
+  var _a = React.useState(false), imgErr = _a[0], setImgErr = _a[1];
+  var photoUrl = email ? CONFIG.siteUrl + '/_layouts/15/userphoto.aspx?size=' + (size>30?'M':'S') + '&accountname=' + encodeURIComponent(email) : null;
+  if (photoUrl && !imgErr) {
+    return h('img',{src:photoUrl,alt:name,onError:function(){setImgErr(true);},style:{width:size,height:size,borderRadius:'50%',objectFit:'cover',flexShrink:0}});
+  }
+  return h('div',{style:{width:size,height:size,borderRadius:'50%',background:oc(initials),display:'flex',alignItems:'center',justifyContent:'center',fontSize:size*0.36,fontWeight:700,color:'#fff',flexShrink:0,userSelect:'none'}},initials);
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  L10 RUNNER COMPONENT                                                       ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+var NdlRunner = (function(_super) {
+  // Extends React.Component
+  function NdlRunner(props) {
+    _super.call(this, props);
+    var durations = {};
+    SECTIONS.forEach(function(s) { durations[s.id] = (CONFIG.defaultDurations[s.id] || 5) * 60; });
+    var sectionElapsed = {};
+    SECTIONS.forEach(function(s) { sectionElapsed[s.id] = 0; });
+    this.state = {
+      meetingName: props.initialMeeting || CONFIG.meetings[0],
+      currentSection: 'segue', elapsedSeconds: 0, sectionElapsed: sectionElapsed,
+      isRunning: false, durations: durations, editingDur: null, durInput: '',
+      attendees: [], metrics: [], rocks: [], issues: [], todos: [], milestones: [],
+      loading: true,
+      segueIdx: 0,
+      expandedIssueId: null, idsStage: 'Identify', newIssueTitle: '', addingIssue: false,
+      solvedThisMeeting: [], idsPriorityNext: 1,
+      expandedRockId: null,
+      showTodoPanel: false, todoTitle: '', todoDue: defaultDue(), todoMeeting: '',
+      todoAssigneeId: null, todoAssigneeLogin: '', todoAssigneeName: '',
+      todoAssigneeSearch: '', todoAssigneeSuggestions: [],
+      todoSourceType: 'Meeting', todoSourceTitle: '', todoSaving: false, todoLinkedIssueId: null,
+      endingMeeting: false, meetingSent: false,
+      currentUserName: '', currentUserEmail: ''
+    };
+    this._timerRef = null;
+    this._pollRef = null;
+    this._sectionStart = 0;
+    return this;
+  }
+  // Inherit from React.Component
+  NdlRunner.prototype = Object.create(_super.prototype);
+  NdlRunner.prototype.constructor = NdlRunner;
+
+  NdlRunner.prototype.componentDidMount = function() {
+    var self = this;
+    spGetCurrentUser().then(function(u) {
+      self.setState({ currentUserName: u.Title || '', currentUserEmail: u.Email || '' });
+    }).catch(function(){});
+    this._loadAll();
+    // Poll SharePoint every 10 seconds so all users see near-real-time updates
+    this._pollRef = setInterval(function() { self._pollData(); }, 10000);
+  };
+  NdlRunner.prototype.componentWillUnmount = function() {
+    if (this._timerRef) clearInterval(this._timerRef);
+    if (this._pollRef) clearInterval(this._pollRef);
+  };
+
+  // ── Background poll (smart merge — preserves UI state) ──
+  NdlRunner.prototype._pollData = function() {
+    var self = this;
+    var mtg = this.state.meetingName;
+    var S = CONFIG.siteUrl;
+    var L = CONFIG.lists;
+    var Q = CONFIG.quarter;
+    Promise.all([
+      spGet(S+"/_api/web/lists/getbytitle('"+L.issues+"')/items?$select=Id,Title,Description,Priority,Status,Owner/Title&$expand=Owner&$filter=Meeting eq '"+encodeURIComponent(mtg)+"' and Status eq 'Open'&$orderby=Priority asc&$top=200"),
+      spGet(S+"/_api/web/lists/getbytitle('"+L.todos+"')/items?$select=Id,Title,DueDate,Completed,SourceType,Created,Owner/Title,Owner/EMail&$expand=Owner&$filter=Meeting eq '"+encodeURIComponent(mtg)+"'&$orderby=DueDate asc&$top=500"),
+      spGet(S+"/_api/web/lists/getbytitle('"+L.rocks+"')/items?$select=Id,Title,Details,RockStatus,BlockerNote,RockType,DueDate,Owner/Title&$expand=Owner&$filter=Meeting eq '"+encodeURIComponent(mtg)+"' and Quarter eq '"+Q+"'&$top=100"),
+      spGet(S+"/_api/web/lists/getbytitle('"+L.milestones+"')/items?$select=Id,Title,RockTitle,DueDate,Completed&$top=1000")
+    ]).then(function(results) {
+      var issuesRaw = results[0], todosRaw = results[1], rocksRaw = results[2], msRaw = results[3];
+
+      var issues = issuesRaw.map(function(i) {
+        return { id:i.Id, title:i.Title||'', description:i.Description||'',
+          priority:i.Priority?Number(i.Priority):null, ownerName:i.Owner?i.Owner.Title:'', issueStatus:i.Status||'Open' };
+      });
+      var todos = todosRaw.map(function(t) {
+        return { id:t.Id, title:t.Title||'', ownerName:t.Owner?t.Owner.Title:'', ownerEmail:t.Owner?t.Owner.EMail:'',
+          dueDate:t.DueDate?t.DueDate.split('T')[0]:'', completed:!!t.Completed,
+          sourceType:t.SourceType||'Meeting', createdDate:t.Created?t.Created.split('T')[0]:'' };
+      });
+      var milestones = msRaw.map(function(m) {
+        return { id:m.Id, title:m.Title||'', rockTitle:m.RockTitle||'', dueDate:m.DueDate?m.DueDate.split('T')[0]:'', completed:!!m.Completed };
+      });
+      var rocks = rocksRaw.filter(function(r){ return r.RockStatus!=='Dropped'&&r.RockStatus!=='Complete'; }).map(function(r) {
+        var ms = msRaw.filter(function(m){ return m.RockTitle===r.Title; });
+        return { id:r.Id, title:r.Title||'', rockStatus:r.RockStatus||'On Track',
+          ownerName:r.Owner?r.Owner.Title:'', rockType:r.RockType||'Individual',
+          milestonesDone:ms.filter(function(m){return m.Completed;}).length,
+          milestonesTotal:ms.length, dueDate:r.DueDate?r.DueDate.split('T')[0]:'' };
+      });
+
+      // Merge: keep local solvedThisMeeting tracking, preserve expandedIssueId etc.
+      self.setState({ issues: issues, todos: todos, rocks: rocks, milestones: milestones });
+    }).catch(function(err) {
+      console.warn('Poll error (will retry):', err);
+    });
+  };
+
+  // ── Timer ──
+  NdlRunner.prototype._startTimer = function() {
+    var self = this;
+    if (this._timerRef) clearInterval(this._timerRef);
+    this._sectionStart = this.state.elapsedSeconds;
+    this._timerRef = setInterval(function() {
+      self.setState(function(prev) {
+        var sec = prev.currentSection;
+        var se = Object.assign({}, prev.sectionElapsed);
+        se[sec] = se[sec] + 1;
+        return { elapsedSeconds: prev.elapsedSeconds + 1, sectionElapsed: se };
+      });
+    }, 1000);
+    this.setState({ isRunning: true });
+  };
+  NdlRunner.prototype._pauseTimer = function() {
+    if (this._timerRef) { clearInterval(this._timerRef); this._timerRef = null; }
+    this.setState({ isRunning: false });
+  };
+  NdlRunner.prototype._goToSection = function(id) {
+    this.setState({ currentSection: id, expandedIssueId: null, expandedRockId: null, idsStage: 'Identify' });
+  };
+
+  // ── Data loading ──
+  NdlRunner.prototype._loadAll = function() {
+    var self = this;
+    var mtg = this.state.meetingName;
+    var S = CONFIG.siteUrl;
+    var L = CONFIG.lists;
+    var Q = CONFIG.quarter;
+    this.setState({ loading: true });
+
+    Promise.all([
+      spGet(S+"/_api/web/lists/getbytitle('"+L.attendees+"')/items?$select=Id,Title,Bio,Attendee/EMail&$expand=Attendee&$filter=Meeting eq '"+encodeURIComponent(mtg)+"'&$top=50"),
+      spGet(S+"/_api/web/lists/getbytitle('"+L.scorecardMetrics+"')/items?$select=Id,Title,Owner,Goal,GoalType,Unit,SortOrder&$filter=Meeting eq '"+encodeURIComponent(mtg)+"'&$orderby=SortOrder asc&$top=100"),
+      spGet(S+"/_api/web/lists/getbytitle('"+L.scorecardData+"')/items?$select=Title,WeekDate,Value,OnTrack&$filter=Meeting eq '"+encodeURIComponent(mtg)+"'&$orderby=WeekDate desc&$top=2000"),
+      spGet(S+"/_api/web/lists/getbytitle('"+L.rocks+"')/items?$select=Id,Title,Details,RockStatus,BlockerNote,RockType,DueDate,Owner/Title&$expand=Owner&$filter=Meeting eq '"+encodeURIComponent(mtg)+"' and Quarter eq '"+Q+"'&$top=100"),
+      spGet(S+"/_api/web/lists/getbytitle('"+L.milestones+"')/items?$select=Id,Title,RockTitle,DueDate,Completed&$top=1000"),
+      spGet(S+"/_api/web/lists/getbytitle('"+L.issues+"')/items?$select=Id,Title,Description,Priority,Status,Owner/Title&$expand=Owner&$filter=Meeting eq '"+encodeURIComponent(mtg)+"' and Status eq 'Open'&$orderby=Priority asc&$top=200"),
+      spGet(S+"/_api/web/lists/getbytitle('"+L.todos+"')/items?$select=Id,Title,DueDate,Completed,SourceType,Created,Owner/Title,Owner/EMail&$expand=Owner&$filter=Meeting eq '"+encodeURIComponent(mtg)+"'&$orderby=DueDate asc&$top=500")
+    ]).then(function(results) {
+      var attRaw = results[0], metricsRaw = results[1], dataRaw = results[2],
+          rocksRaw = results[3], msRaw = results[4], issuesRaw = results[5], todosRaw = results[6];
+
+      var attendees = attRaw.map(function(a) {
+        return { id: a.Id, name: a.Title||'', bio: a.Bio||'', email: a.Attendee?a.Attendee.EMail:'' };
+      });
+
+      var metrics = metricsRaw.map(function(m) {
+        var vals = dataRaw.filter(function(d){ return d.Title===m.Title; }).slice(0,13).map(function(d){
+          return { weekDate: d.WeekDate?d.WeekDate.split('T')[0]:'', value: d.Value, onTrack: d.OnTrack };
+        });
+        return { id:m.Id, title:m.Title, owner:m.Owner||'', goal:m.Goal, goalType:m.GoalType, unit:m.Unit, recentValues:vals };
+      });
+
+      var milestones = msRaw.map(function(m) {
+        return { id:m.Id, title:m.Title||'', rockTitle:m.RockTitle||'', dueDate:m.DueDate?m.DueDate.split('T')[0]:'', completed:!!m.Completed };
+      });
+
+      var rocks = rocksRaw.filter(function(r){ return r.RockStatus!=='Dropped'&&r.RockStatus!=='Complete'; }).map(function(r) {
+        var ms = msRaw.filter(function(m){ return m.RockTitle===r.Title; });
+        return { id:r.Id, title:r.Title||'', rockStatus:r.RockStatus||'On Track',
+          ownerName:r.Owner?r.Owner.Title:'', rockType:r.RockType||'Individual',
+          milestonesDone:ms.filter(function(m){return m.Completed;}).length,
+          milestonesTotal:ms.length, dueDate:r.DueDate?r.DueDate.split('T')[0]:'' };
+      });
+
+      var issues = issuesRaw.map(function(i) {
+        return { id:i.Id, title:i.Title||'', description:i.Description||'',
+          priority:i.Priority?Number(i.Priority):null, ownerName:i.Owner?i.Owner.Title:'', issueStatus:i.Status||'Open' };
+      });
+
+      var todos = todosRaw.map(function(t) {
+        return { id:t.Id, title:t.Title||'', ownerName:t.Owner?t.Owner.Title:'', ownerEmail:t.Owner?t.Owner.EMail:'',
+          dueDate:t.DueDate?t.DueDate.split('T')[0]:'', completed:!!t.Completed,
+          sourceType:t.SourceType||'Meeting', createdDate:t.Created?t.Created.split('T')[0]:'' };
+      });
+
+      self.setState({ attendees:attendees, metrics:metrics, rocks:rocks, issues:issues, todos:todos, milestones:milestones, loading:false,
+        todoMeeting: mtg, segueIdx: 0, expandedIssueId: null, expandedRockId: null,
+        solvedThisMeeting: [], idsPriorityNext: 1 });
+      self._autoAddOffTrackIssues(metrics, rocks, issues);
+    }).catch(function(err) {
+      console.error('Runner load error:', err);
+      self.setState({ loading: false });
+    });
+  };
+
+  NdlRunner.prototype._autoAddOffTrackIssues = function(metrics, rocks, existingIssues) {
+    var self = this;
+    var existing = existingIssues.map(function(i){ return i.title.toLowerCase(); });
+    var toAdd = [];
+    metrics.forEach(function(m) {
+      if (m.recentValues.length >= 2 && m.recentValues.slice(0,2).every(function(v){ return v.onTrack==='No'; })) {
+        var title = m.title + ' \u2014 off track 2+ weeks';
+        if (existing.indexOf(title.toLowerCase()) === -1)
+          toAdd.push({ title:title, description: m.title+' has been off track for two consecutive weeks. Goal: '+m.goal+'.' });
+      }
+    });
+    rocks.filter(function(r){ return r.rockStatus==='Off Track'||r.rockStatus==='Blocked'; }).forEach(function(r) {
+      var title = 'Rock '+r.rockStatus.toLowerCase()+': '+r.title;
+      if (existing.indexOf(title.toLowerCase()) === -1)
+        toAdd.push({ title:title, description: r.title+' ('+r.ownerName+') is '+r.rockStatus+'.' });
+    });
+    if (!toAdd.length) return;
+    spGetCurrentUser().then(function(u) {
+      var ownerId = u.Id;
+      toAdd.forEach(function(item) {
+        spPost(CONFIG.siteUrl+"/_api/web/lists/getbytitle('"+CONFIG.lists.issues+"')/items", {
+          __metadata:{type:'SP.Data.Issues_x0020_ListListItem'}, Title:item.title,
+          Description:item.description, OwnerId:ownerId, Meeting:self.state.meetingName,
+          Status:'Open', CreatedDate:new Date().toISOString()
+        }).then(function(ni) {
+          self.setState(function(prev) {
+            return { issues: prev.issues.concat([{id:ni.Id,title:item.title,description:item.description,priority:null,ownerName:'',issueStatus:'Open'}]) };
+          });
+        }).catch(function(e){ console.error('Auto-add error:',e); });
+      });
+    }).catch(function(e){ console.error('Auto-add error:',e); });
+  };
+
+  // ── Issue actions ──
+  NdlRunner.prototype._setIssueStatus = function(issue, status) {
+    var self = this;
+    this.setState(function(prev) {
+      return {
+        issues: prev.issues.map(function(i){ return i.id===issue.id?Object.assign({},i,{issueStatus:status}):i; }),
+        solvedThisMeeting: status==='Solved' ? prev.solvedThisMeeting.concat([issue.id]) : prev.solvedThisMeeting.filter(function(id){return id!==issue.id;}),
+        expandedIssueId: null
+      };
+    });
+    spPatch(CONFIG.siteUrl+"/_api/web/lists/getbytitle('"+CONFIG.lists.issues+"')/items("+issue.id+")", {
+      __metadata:{type:'SP.Data.Issues_x0020_ListListItem'}, Status:status,
+      SolvedDate: status==='Solved' ? new Date().toISOString() : null
+    }).catch(function(e){ console.error(e); });
+  };
+
+  NdlRunner.prototype._assignNextPriority = function(issue) {
+    var self = this;
+    if (this.state.idsPriorityNext > 3) return;
+    if (issue.priority !== null) return;
+    var newP = this.state.idsPriorityNext;
+    this.setState(function(prev) {
+      var updated = prev.issues.map(function(i){ return i.id===issue.id?Object.assign({},i,{priority:newP}):i; });
+      updated.sort(function(a,b) {
+        if(a.priority===null&&b.priority===null)return 0;
+        if(a.priority===null)return 1; if(b.priority===null)return -1;
+        return a.priority-b.priority;
+      });
+      return { issues: updated, idsPriorityNext: prev.idsPriorityNext + 1 };
+    });
+    spPatch(CONFIG.siteUrl+"/_api/web/lists/getbytitle('"+CONFIG.lists.issues+"')/items("+issue.id+")", {
+      __metadata:{type:'SP.Data.Issues_x0020_ListListItem'}, Priority: newP
+    }).catch(function(e){ console.error(e); });
+  };
+
+  NdlRunner.prototype._unassignPriority = function(issue) {
+    var self = this;
+    if (issue.priority === null) return;
+    var removedP = issue.priority;
+    this.setState(function(prev) {
+      var updated = prev.issues.map(function(i) {
+        if (i.id === issue.id) return Object.assign({},i,{priority:null});
+        if (i.priority !== null && i.priority > removedP) return Object.assign({},i,{priority:i.priority-1});
+        return i;
+      });
+      updated.sort(function(a,b) {
+        if(a.priority===null&&b.priority===null)return 0;
+        if(a.priority===null)return 1; if(b.priority===null)return -1;
+        return a.priority-b.priority;
+      });
+      return { issues: updated, idsPriorityNext: Math.max(1, prev.idsPriorityNext - 1) };
+    });
+    spPatch(CONFIG.siteUrl+"/_api/web/lists/getbytitle('"+CONFIG.lists.issues+"')/items("+issue.id+")", {
+      __metadata:{type:'SP.Data.Issues_x0020_ListListItem'}, Priority: null
+    }).catch(function(e){ console.error(e); });
+    // Update shifted items
+    this.state.issues.filter(function(i){ return i.priority!==null && i.id!==issue.id; }).forEach(function(i) {
+      spPatch(CONFIG.siteUrl+"/_api/web/lists/getbytitle('"+CONFIG.lists.issues+"')/items("+i.id+")", {
+        __metadata:{type:'SP.Data.Issues_x0020_ListListItem'}, Priority: i.priority
+      }).catch(function(e){ console.error(e); });
+    });
+  };
+
+  NdlRunner.prototype._clearPriorities = function() {
+    var self = this;
+    var toUpdate = this.state.issues.filter(function(i){ return i.priority!==null; });
+    this.setState(function(prev) {
+      return { issues: prev.issues.map(function(i){ return Object.assign({},i,{priority:null}); }), idsPriorityNext: 1 };
+    });
+    toUpdate.forEach(function(i) {
+      spPatch(CONFIG.siteUrl+"/_api/web/lists/getbytitle('"+CONFIG.lists.issues+"')/items("+i.id+")", {
+        __metadata:{type:'SP.Data.Issues_x0020_ListListItem'}, Priority: null
+      }).catch(function(e){ console.error(e); });
+    });
+  };
+
+  NdlRunner.prototype._addQuickIssue = function() {
+    var self = this;
+    var title = this.state.newIssueTitle;
+    if (!title.trim()) return;
+    this.setState({ addingIssue: true });
+    spGetCurrentUser().then(function(u) {
+      return spPost(CONFIG.siteUrl+"/_api/web/lists/getbytitle('"+CONFIG.lists.issues+"')/items", {
+        __metadata:{type:'SP.Data.Issues_x0020_ListListItem'}, Title:title.trim(),
+        OwnerId:u.Id, Meeting:self.state.meetingName, Status:'Open', CreatedDate:new Date().toISOString()
+      });
+    }).then(function(ni) {
+      self.setState(function(prev) {
+        return { issues: prev.issues.concat([{id:ni.Id,title:title.trim(),description:'',priority:null,ownerName:prev.currentUserName,issueStatus:'Open'}]),
+          newIssueTitle:'', addingIssue:false };
+      });
+    }).catch(function(e) { console.error(e); self.setState({addingIssue:false}); });
+  };
+
+  // ── Rock status ──
+  NdlRunner.prototype._setRockStatus = function(rock, status) {
+    this.setState(function(prev) {
+      return { rocks: prev.rocks.map(function(r){ return r.id===rock.id?Object.assign({},r,{rockStatus:status}):r; }) };
+    });
+    spPatch(CONFIG.siteUrl+"/_api/web/lists/getbytitle('"+CONFIG.lists.rocks+"')/items("+rock.id+")", {
+      __metadata:{type:'SP.Data.RocksListItem'}, RockStatus: status
+    }).catch(function(e){ console.error(e); });
+  };
+
+  // ── To-Do actions ──
+  NdlRunner.prototype._searchTodoAssignee = function(query) {
+    var self = this;
+    if (!query || query.length < 2) { this.setState({todoAssigneeSuggestions:[]}); return; }
+    spSearchPeople(query).then(function(results) {
+      self.setState({ todoAssigneeSuggestions: results.filter(function(u){return u.EntityType==='User';}).map(function(u){
+        return { id:0, name:u.DisplayText, email:u.Description||'', loginName:u.Key };
+      })});
+    }).catch(function(){ self.setState({todoAssigneeSuggestions:[]}); });
+  };
+
+  NdlRunner.prototype._completeTodo = function(todo) {
+    this.setState(function(prev) {
+      return { todos: prev.todos.map(function(t){ return t.id===todo.id?Object.assign({},t,{completed:true}):t; }) };
+    });
+    spPatch(CONFIG.siteUrl+"/_api/web/lists/getbytitle('"+CONFIG.lists.todos+"')/items("+todo.id+")", {
+      __metadata:{type:'SP.Data.ToDosListItem'}, Completed:true, CompletedDate:new Date().toISOString()
+    }).catch(function(e){ console.error(e); });
+  };
+
+  NdlRunner.prototype._submitTodo = function() {
+    var self = this;
+    var st = this.state;
+    if (!st.todoTitle.trim()) return;
+    this.setState({ todoSaving: true });
+    var ownerPromise;
+    if (st.todoAssigneeLogin) {
+      ownerPromise = spEnsureUser(st.todoAssigneeLogin).then(function(u){ return u.Id; });
+    } else {
+      ownerPromise = spGetCurrentUser().then(function(u){ return u.Id; });
+    }
+    ownerPromise.then(function(ownerId) {
+      return spPost(CONFIG.siteUrl+"/_api/web/lists/getbytitle('"+CONFIG.lists.todos+"')/items", {
+        __metadata:{type:'SP.Data.ToDosListItem'}, Title:st.todoTitle.trim(), OwnerId:ownerId,
+        Meeting: st.todoMeeting || st.meetingName, DueDate: st.todoDue ? st.todoDue+'T00:00:00Z' : null,
+        Completed: false, SourceType: st.todoSourceType,
+        SourceTitle: st.todoLinkedIssueId ? (st.issues.find(function(i){return i.id===st.todoLinkedIssueId;})||{}).title||'' : st.todoSourceTitle.trim()
+      });
+    }).then(function(ni) {
+      var newTodo = { id:ni.Id, title:st.todoTitle.trim(), ownerName:st.todoAssigneeName||st.currentUserName,
+        ownerEmail:'', dueDate:st.todoDue, completed:false, sourceType:st.todoSourceType, createdDate:todayISO() };
+      self.setState(function(prev) {
+        return { todos:prev.todos.concat([newTodo]), showTodoPanel:false, todoTitle:'', todoDue:defaultDue(),
+          todoMeeting:prev.meetingName, todoAssigneeId:null, todoAssigneeLogin:'', todoAssigneeName:'',
+          todoAssigneeSearch:'', todoAssigneeSuggestions:[], todoSourceType:'Meeting', todoSourceTitle:'',
+          todoSaving:false, todoLinkedIssueId:null };
+      });
+    }).catch(function(e) { console.error(e); self.setState({todoSaving:false}); });
+  };
+
+  // ── End meeting ──
+  NdlRunner.prototype._endMeeting = function() {
+    var self = this;
+    this.setState({ endingMeeting: true });
+    var st = this.state;
+    var payload = {
+      meetingName: st.meetingName,
+      meetingDate: new Date().toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'}),
+      recipients: st.attendees.filter(function(a){return a.email;}).map(function(a){return{name:a.name,email:a.email};}),
+      solvedIssues: st.issues.filter(function(i){return st.solvedThisMeeting.indexOf(i.id)!==-1;}).map(function(i){return i.title;}),
+      openIssues: st.issues.filter(function(i){return i.issueStatus==='Open'&&st.solvedThisMeeting.indexOf(i.id)===-1;}).length,
+      newTodos: st.todos.filter(function(t){return t.createdDate===todayISO();}).map(function(t){return{title:t.title,owner:t.ownerName,due:t.dueDate};}),
+      rocksOnTrack: st.rocks.filter(function(r){return r.rockStatus==='On Track';}).length,
+      rocksTotal: st.rocks.length,
+      offTrackMetrics: st.metrics.filter(function(m){return m.recentValues.length>0&&m.recentValues[0].onTrack==='No';}).map(function(m){return m.title;}),
+      durationMinutes: Math.round(st.elapsedSeconds/60)
+    };
+    var done = function() { self.setState({endingMeeting:false, meetingSent:true}); };
+    if (CONFIG.flowUrl) {
+      fetch(CONFIG.flowUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(done).catch(function(e){console.error('Flow error:',e);done();});
+    } else { done(); }
+  };
+
+  // ── Meeting switcher ──
+  NdlRunner.prototype._switchMeeting = function(name) {
+    this.setState({ meetingName: name, loading: true, meetingSent: false, solvedThisMeeting: [], idsPriorityNext: 1 }, function() {
+      this._loadAll();
+    }.bind(this));
+  };
+
+  // ╔════════════════════════════════════════════════════════════════════════════╗
+  // ║  RENDERERS                                                                ║
+  // ╚════════════════════════════════════════════════════════════════════════════╝
+
+  NdlRunner.prototype._renderSegue = function() {
+    var self = this;
+    var attendees = this.state.attendees, segueIdx = this.state.segueIdx;
+    if (!attendees.length) return h('div',{style:{padding:32,textAlign:'center',color:'#9ca3af',fontSize:13}},'No attendees found.');
+    var cur = attendees[segueIdx];
+    return h('div',{style:{display:'flex',flexDirection:'column',gap:12}},
+      h('div',{style:{background:'#f0faf8',border:'1px solid #ccfbf1',borderRadius:10,padding:'20px 22px',display:'flex',alignItems:'flex-start',gap:14}},
+        h(Av,{name:cur.name,size:48,email:cur.email}),
+        h('div',{style:{flex:1}},
+          h('div',{style:{fontSize:17,fontWeight:700,color:'#111827'}},cur.name),
+          h('div',{style:{fontSize:13,color:'#6b7280',marginTop:6,lineHeight:1.6}},cur.bio||'No bio set.'),
+          h('div',{style:{display:'flex',gap:8,marginTop:12}},
+            h('button',{onClick:function(){self.setState({segueIdx:Math.max(0,segueIdx-1)});},disabled:segueIdx===0,style:{fontSize:12,padding:'6px 14px',borderRadius:7,border:'1px solid #e5e7eb',background:'#fff',color:'#374151',cursor:segueIdx===0?'default':'pointer',opacity:segueIdx===0?0.4:1,fontFamily:'inherit'}},'\u2190 Prev'),
+            h('button',{onClick:function(){self.setState({segueIdx:Math.min(attendees.length-1,segueIdx+1)});},disabled:segueIdx===attendees.length-1,style:{fontSize:12,padding:'6px 14px',borderRadius:7,border:'none',background:'#0D2D3A',color:'#fff',cursor:segueIdx===attendees.length-1?'default':'pointer',opacity:segueIdx===attendees.length-1?0.4:1,fontWeight:600,fontFamily:'inherit'}},'Next \u2192')
+          )
+        )
+      ),
+      h('div',{style:{fontSize:11,fontWeight:600,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.5px'}},'All attendees'),
+      attendees.map(function(a,i) {
+        return h('div',{key:a.id,onClick:function(){self.setState({segueIdx:i});},style:{display:'flex',alignItems:'center',gap:10,padding:'8px 12px',borderRadius:8,border:'1px solid',borderColor:i===segueIdx?'#0f766e':'#f0f0f0',background:i===segueIdx?'#f0faf8':'#fff',cursor:'pointer'}},
+          h(Av,{name:a.name,size:22,email:a.email}),
+          h('span',{style:{flex:1,fontSize:13,fontWeight:i===segueIdx?600:400,color:i===segueIdx?'#0f766e':'#374151'}},a.name),
+          i<segueIdx && h('span',{style:{fontSize:11,color:'#0f766e',fontWeight:600}},'\u2713')
+        );
+      })
+    );
+  };
+
+  NdlRunner.prototype._renderScorecard = function() {
+    var metrics = this.state.metrics;
+    if (!metrics.length) return h('div',{style:{padding:32,textAlign:'center',color:'#9ca3af'}},'No scorecard metrics.');
+    var allDates = {};
+    metrics.forEach(function(m){ m.recentValues.forEach(function(v){ if(v.weekDate) allDates[v.weekDate]=1; }); });
+    var sorted = Object.keys(allDates).sort().reverse().slice(0,13);
+
+    return h('div',{style:{overflowX:'auto'}},
+      h('table',{style:{width:'100%',borderCollapse:'collapse',fontSize:12}},
+        h('thead',null,
+          h('tr',null,
+            h('th',{style:{textAlign:'left',padding:'6px 12px',fontSize:11,fontWeight:600,color:'#9ca3af',textTransform:'uppercase',letterSpacing:'.4px',borderBottom:'1px solid #f0f0f0'}},'Metric'),
+            h('th',{style:{padding:'6px 8px',fontSize:11,fontWeight:600,color:'#9ca3af',textAlign:'center',borderBottom:'1px solid #f0f0f0',whiteSpace:'nowrap'}},'Goal'),
+            h('th',{style:{padding:'6px 8px',fontSize:11,fontWeight:600,color:'#9ca3af',textAlign:'center',borderBottom:'1px solid #f0f0f0'}},''),
+            sorted.map(function(w){ return h('th',{key:w,style:{padding:'4px 6px',fontSize:10,fontWeight:600,color:'#9ca3af',textAlign:'center',borderBottom:'1px solid #f0f0f0',whiteSpace:'nowrap',minWidth:42}},fmtDate(w)); })
+          )
+        ),
+        h('tbody',null,
+          metrics.map(function(m) {
+            var twoOff = m.recentValues.length>=2 && m.recentValues.slice(0,2).every(function(v){return v.onTrack==='No';});
+            var dataMap = {};
+            m.recentValues.forEach(function(v){ if(v.weekDate) dataMap[v.weekDate]={value:v.value,onTrack:v.onTrack}; });
+            return h('tr',{key:m.id,style:{borderLeft:twoOff?'3px solid #fca5a5':'3px solid transparent',background:twoOff?'#fffbfb':'#fff'}},
+              h('td',{style:{padding:'10px 12px',borderBottom:'1px solid #f9fafb'}},
+                h('div',{style:{fontSize:13,fontWeight:500,color:'#111827'}},m.title),
+                h('div',{style:{fontSize:11,color:'#9ca3af'}},m.owner),
+                twoOff && h('div',{style:{fontSize:10,color:'#991b1b',fontWeight:600,marginTop:2}},'\u26A0 Added to IDS')
+              ),
+              h('td',{style:{padding:'8px',textAlign:'center',borderBottom:'1px solid #f9fafb',fontSize:12,color:'#6b7280',whiteSpace:'nowrap'}},fmtVal(m.goal,m.unit)),
+              h('td',{style:{padding:'4px 8px',borderBottom:'1px solid #f9fafb',textAlign:'center'}},sparkline(m.recentValues)),
+              sorted.map(function(w) {
+                var v = dataMap[w];
+                if (!v) return h('td',{key:w,style:{padding:'4px 6px',textAlign:'center',borderBottom:'1px solid #f9fafb',color:'#e5e7eb'}},'-');
+                var on = v.onTrack==='Yes';
+                return h('td',{key:w,style:{padding:'4px 6px',textAlign:'center',borderBottom:'1px solid #f9fafb'}},
+                  h('span',{style:{fontSize:12,fontWeight:600,padding:'2px 5px',borderRadius:4,background:on?'#d1fae5':'#fee2e2',color:on?'#065f46':'#991b1b'}},fmtVal(v.value,m.unit))
+                );
+              })
+            );
+          })
+        )
+      )
+    );
+  };
+
+  NdlRunner.prototype._renderNews = function() {
+    return h('div',{style:{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:16,padding:48,minHeight:300}},
+      h('div',{style:{fontSize:32}},'\uD83D\uDCF0'),
+      h('div',{style:{fontSize:18,fontWeight:700,color:'#111827'}},'Industry News'),
+      h('div',{style:{fontSize:14,color:'#6b7280',maxWidth:400,textAlign:'center',lineHeight:1.6}},'Open discussion \u2014 share relevant industry updates, competitor news, or market trends.'),
+      h('div',{style:{background:'#f0faf8',border:'1px solid #ccfbf1',borderRadius:10,padding:'14px 20px',display:'flex',alignItems:'center',gap:10,marginTop:8}},
+        h('span',{style:{fontSize:13,color:'#0f766e',fontWeight:500}},'Tip: Save anything actionable as an issue or to-do using the buttons in the header.')
+      )
+    );
+  };
+
+  NdlRunner.prototype._renderRocks = function() {
+    var self = this;
+    var rocks = this.state.rocks, expandedRockId = this.state.expandedRockId, milestones = this.state.milestones;
+    if (!rocks.length) return h('div',{style:{padding:32,textAlign:'center',color:'#9ca3af'}},'No rocks for this quarter.');
+    var company = rocks.filter(function(r){return r.rockType==='Company';});
+    var individual = rocks.filter(function(r){return r.rockType==='Individual';});
+    var onTrack = rocks.filter(function(r){return r.rockStatus==='On Track';}).length;
+
+    var rockCard = function(r) {
+      var cfg = ROCK_STATUS[r.rockStatus] || ROCK_STATUS['Dropped'];
+      var isExp = expandedRockId === r.id;
+      var pct = r.milestonesTotal > 0 ? Math.round((r.milestonesDone/r.milestonesTotal)*100) : null;
+      var warn = r.rockStatus==='On Track' && pct!==null && pct<30 && r.milestonesTotal>=2;
+      var rMs = milestones.filter(function(m){return m.rockTitle===r.title;});
+
+      return h('div',{key:r.id,style:{background:'#fff',border:'1px solid '+(isExp?'#e5e7eb':'#f0f0f0'),borderRadius:10,overflow:'hidden'}},
+        h('div',{onClick:function(){self.setState({expandedRockId:isExp?null:r.id});},style:{display:'flex',alignItems:'center',gap:10,padding:'12px 14px',cursor:'pointer'}},
+          h('span',{style:{fontSize:11,padding:'3px 9px',borderRadius:20,fontWeight:700,flexShrink:0,background:cfg.bg,color:cfg.color,border:'1px solid '+cfg.border}},r.rockStatus),
+          h('span',{style:{flex:1,fontSize:13,fontWeight:500,color:'#111827'}},r.title),
+          h(Av,{name:r.ownerName,size:20}),
+          pct!==null && h('span',{style:{fontSize:11,color:'#9ca3af',margin:'0 4px'}},r.milestonesDone+'/'+r.milestonesTotal),
+          h('svg',{viewBox:'0 0 16 16',fill:'none',stroke:'#9ca3af',strokeWidth:'1.5',style:{width:14,height:14,flexShrink:0,transform:isExp?'rotate(180deg)':'none',transition:'transform .15s'}},h('path',{d:'M4 6l4 4 4-4'}))
+        ),
+        pct!==null && !isExp && h('div',{style:{padding:'0 14px 10px'}},
+          h('div',{style:{display:'flex',justifyContent:'space-between',marginBottom:3}},
+            h('span',{style:{fontSize:10.5,color:warn?'#b45309':'#9ca3af',fontWeight:warn?700:400}},warn?('\u26A0 '+r.milestonesDone+'/'+r.milestonesTotal+' milestones \u2014 needs review'):(r.milestonesDone+'/'+r.milestonesTotal+' milestones')),
+            h('span',{style:{fontSize:10.5,color:'#9ca3af'}},pct+'%')
+          ),
+          h('div',{style:{height:5,background:'#f3f4f6',borderRadius:3,overflow:'hidden'}},
+            h('div',{style:{height:'100%',width:pct+'%',background:warn?'#f59e0b':r.rockStatus==='On Track'?'#10b981':r.rockStatus==='Blocked'?'#f59e0b':'#ef4444',borderRadius:3}})
+          )
+        ),
+        isExp && h('div',{style:{borderTop:'1px solid #f0f0f0',padding:'12px 14px',display:'flex',flexDirection:'column',gap:10}},
+          pct!==null && h('div',null,
+            h('div',{style:{display:'flex',justifyContent:'space-between',marginBottom:3}},
+              h('span',{style:{fontSize:11,color:warn?'#b45309':'#9ca3af',fontWeight:warn?700:400}},warn?('\u26A0 '+r.milestonesDone+'/'+r.milestonesTotal+' milestones \u2014 needs review'):(r.milestonesDone+'/'+r.milestonesTotal+' milestones')),
+              h('span',{style:{fontSize:11,color:'#9ca3af'}},pct+'%')
+            ),
+            h('div',{style:{height:6,background:'#f3f4f6',borderRadius:3,overflow:'hidden'}},
+              h('div',{style:{height:'100%',width:pct+'%',background:warn?'#f59e0b':r.rockStatus==='On Track'?'#10b981':r.rockStatus==='Blocked'?'#f59e0b':'#ef4444',borderRadius:3}})
+            )
+          ),
+          h('div',{style:{display:'flex',gap:6,flexWrap:'wrap'}},
+            h('span',{style:{fontSize:10.5,color:'#9ca3af',fontWeight:600,textTransform:'uppercase',letterSpacing:'.4px',alignSelf:'center'}},'Status'),
+            ['On Track','Off Track','Blocked','Complete'].map(function(s) {
+              var sc = ROCK_STATUS[s]||ROCK_STATUS['Dropped'];
+              return h('button',{key:s,onClick:function(){self._setRockStatus(r,s);},style:{fontSize:11,padding:'4px 10px',borderRadius:20,cursor:'pointer',fontWeight:600,fontFamily:'inherit',border:'1px solid '+(r.rockStatus===s?sc.border:'#e5e7eb'),background:r.rockStatus===s?sc.bg:'#fff',color:r.rockStatus===s?sc.color:'#9ca3af'}},s);
+            })
+          ),
+          h('div',{style:{display:'flex',flexDirection:'column',gap:6}},
+            h('div',{style:{fontSize:10.5,fontWeight:600,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.5px'}},'Milestones'),
+            rMs.length===0
+              ? h('div',{style:{fontSize:12,color:'#9ca3af',fontStyle:'italic'}},'No milestones')
+              : rMs.map(function(ms) {
+                  return h('div',{key:ms.id,style:{display:'flex',alignItems:'center',gap:8}},
+                    h('div',{style:{width:16,height:16,borderRadius:3,flexShrink:0,border:ms.completed?'none':'1.5px solid #d1d5db',background:ms.completed?'#0D2D3A':'#fff',display:'flex',alignItems:'center',justifyContent:'center'}},
+                      ms.completed && h('svg',{viewBox:'0 0 10 10',fill:'none',style:{width:9,height:9}},h('path',{d:'M2 5l2.5 2.5L8 3',stroke:'#fff',strokeWidth:'1.5',strokeLinecap:'round'}))
+                    ),
+                    h('span',{style:{fontSize:12.5,color:ms.completed?'#9ca3af':'#374151',textDecoration:ms.completed?'line-through':'none',flex:1}},ms.title),
+                    ms.dueDate && h('span',{style:{fontSize:11,color:'#9ca3af'}},fmtDate(ms.dueDate))
+                  );
+                })
+          )
+        )
+      );
+    };
+
+    return h('div',{style:{display:'flex',flexDirection:'column',gap:16}},
+      h('div',{style:{display:'flex',gap:8}},
+        h('span',{style:{fontSize:12,padding:'3px 10px',borderRadius:12,background:'#ccfbf1',color:'#0f766e',fontWeight:500}},onTrack+'/'+rocks.length+' on track'),
+        rocks.filter(function(r){return r.rockStatus==='Blocked';}).length>0 && h('span',{style:{fontSize:12,padding:'3px 10px',borderRadius:12,background:'#fef3c7',color:'#92400e',fontWeight:500}},rocks.filter(function(r){return r.rockStatus==='Blocked';}).length+' blocked \u2192 IDS')
+      ),
+      company.length>0 && h('div',{style:{display:'flex',flexDirection:'column',gap:6}},
+        h('div',{style:{fontSize:11,fontWeight:600,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.5px'}},'Company rocks'),
+        company.map(rockCard)
+      ),
+      individual.length>0 && h('div',{style:{display:'flex',flexDirection:'column',gap:6}},
+        h('div',{style:{fontSize:11,fontWeight:600,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.5px'}},'Individual rocks'),
+        individual.map(rockCard)
+      )
+    );
+  };
+
+  NdlRunner.prototype._renderTodos = function() {
+    var self = this;
+    var todos = this.state.todos;
+    var open = todos.filter(function(t){return !t.completed;});
+    var sevenDaysAgo = new Date(); sevenDaysAgo.setDate(sevenDaysAgo.getDate()-7);
+    var completed = todos.filter(function(t){return t.completed && t.dueDate && new Date(t.dueDate+'T12:00:00')>=sevenDaysAgo;});
+    var overdue = open.filter(function(t){return isOverdue(t.dueDate);});
+
+    var row = function(t) {
+      return h('div',{key:t.id,style:{display:'flex',alignItems:'center',gap:10,padding:'10px 12px',background:isOverdue(t.dueDate)&&!t.completed?'#fffbfb':'#fff',borderRadius:8,border:'1px solid',borderColor:isOverdue(t.dueDate)&&!t.completed?'#fca5a5':'#f0f0f0',borderLeft:isOverdue(t.dueDate)&&!t.completed?'3px solid #fca5a5':'3px solid transparent'}},
+        h('button',{onClick:function(){if(!t.completed)self._completeTodo(t);},style:{width:20,height:20,borderRadius:4,border:t.completed?'none':'1.5px solid #d1d5db',background:t.completed?'#0D2D3A':'#fff',cursor:t.completed?'default':'pointer',flexShrink:0,display:'flex',alignItems:'center',justifyContent:'center',padding:0}},
+          t.completed && h('svg',{viewBox:'0 0 10 10',fill:'none',style:{width:10,height:10}},h('path',{d:'M2 5l2.5 2.5L8 3',stroke:'#fff',strokeWidth:'1.5',strokeLinecap:'round'}))
+        ),
+        h(Av,{name:t.ownerName,size:22,email:t.ownerEmail}),
+        h('span',{style:{flex:1,fontSize:13,color:t.completed?'#9ca3af':'#111827',textDecoration:t.completed?'line-through':'none'}},t.title),
+        h('span',{style:{fontSize:11,padding:'2px 8px',borderRadius:6,background:isOverdue(t.dueDate)&&!t.completed?'#fee2e2':'#f3f4f6',color:isOverdue(t.dueDate)&&!t.completed?'#991b1b':'#6b7280',fontWeight:isOverdue(t.dueDate)&&!t.completed?600:400}},
+          isOverdue(t.dueDate)&&!t.completed ? Math.abs(Math.round((new Date(t.dueDate+'T12:00:00').getTime()-new Date().getTime())/(1000*60*60*24)))+'d overdue' : fmtDate(t.dueDate)
+        )
+      );
+    };
+
+    return h('div',{style:{display:'flex',flexDirection:'column',gap:12}},
+      h('div',{style:{display:'flex',gap:8}},
+        h('span',{style:{fontSize:12,padding:'3px 10px',borderRadius:12,background:'#ccfbf1',color:'#0f766e',fontWeight:500}},open.length+' open'),
+        overdue.length>0 && h('span',{style:{fontSize:12,padding:'3px 10px',borderRadius:12,background:'#fee2e2',color:'#991b1b',fontWeight:500}},overdue.length+' overdue'),
+        completed.length>0 && h('span',{style:{fontSize:12,padding:'3px 10px',borderRadius:12,background:'#f0faf8',color:'#0f766e',fontWeight:500}},completed.length+' recent \u2713')
+      ),
+      overdue.length>0 && h('div',{style:{display:'flex',flexDirection:'column',gap:6}},
+        h('div',{style:{fontSize:11,fontWeight:600,color:'#991b1b',textTransform:'uppercase',letterSpacing:'.5px'}},'Overdue'),
+        overdue.map(row)
+      ),
+      open.filter(function(t){return !isOverdue(t.dueDate);}).length>0 && h('div',{style:{display:'flex',flexDirection:'column',gap:6}},
+        h('div',{style:{fontSize:11,fontWeight:600,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.5px'}},'Open'),
+        open.filter(function(t){return !isOverdue(t.dueDate);}).map(row)
+      ),
+      completed.length>0 && h('div',{style:{display:'flex',flexDirection:'column',gap:6}},
+        h('div',{style:{fontSize:11,fontWeight:600,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.5px'}},'Completed'),
+        completed.map(row)
+      )
+    );
+  };
+
+  NdlRunner.prototype._renderIDS = function() {
+    var self = this;
+    var issues = this.state.issues, expandedIssueId = this.state.expandedIssueId;
+    var newIssueTitle = this.state.newIssueTitle, addingIssue = this.state.addingIssue;
+    var open = issues.filter(function(i){return i.issueStatus==='Open';});
+    var solved = issues.filter(function(i){return i.issueStatus==='Solved';});
+    var idsPriorityNext = this.state.idsPriorityNext;
+    var pColors = {'1':{bg:'#fecaca',color:'#991b1b'},'2':{bg:'#fed7aa',color:'#92400e'},'3':{bg:'#bbf7d0',color:'#065f46'}};
+
+    var issueRow = function(i) {
+      var isExp = expandedIssueId === i.id;
+      var pc = i.priority !== null ? pColors[String(i.priority)] : null;
+      return h('div',{key:i.id,style:{background:'#fff',border:'1px solid',borderColor:isExp?'#0f766e':'#f0f0f0',borderRadius:10,overflow:'hidden'}},
+        h('div',{onClick:function(){self.setState({expandedIssueId:isExp?null:i.id});},style:{display:'flex',alignItems:'center',gap:10,padding:'11px 14px',cursor:'pointer',background:isExp?'#f0faf8':'#fff'}},
+          i.priority !== null
+            ? h('button',{onClick:function(e){e.stopPropagation();self._unassignPriority(i);},title:'Click to remove priority',style:{width:24,height:24,borderRadius:'50%',flexShrink:0,background:pc?pc.bg:'#f3f4f6',border:'2px solid '+(pc?pc.color:'#9ca3af'),display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:800,color:pc?pc.color:'#9ca3af',cursor:'pointer',padding:0,fontFamily:'inherit'}},String(i.priority))
+            : h('button',{onClick:function(e){e.stopPropagation();self._assignNextPriority(i);},title:idsPriorityNext<=3?'Assign #'+idsPriorityNext:'All 3 assigned',disabled:idsPriorityNext>3,style:{width:24,height:24,borderRadius:'50%',flexShrink:0,border:'1.5px dashed #d1d5db',background:'#fff',cursor:idsPriorityNext<=3?'pointer':'default',display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,color:'#9ca3af',fontFamily:'inherit',opacity:idsPriorityNext<=3?1:0.4}},idsPriorityNext<=3?String(idsPriorityNext):'\u00B7'),
+          h('div',{style:{flex:1,minWidth:0}},
+            h('div',{style:{fontSize:13,fontWeight:isExp?600:500,color:isExp?'#0f766e':'#111827'}},i.title),
+            i.ownerName && h('div',{style:{fontSize:11,color:'#9ca3af',marginTop:1}},i.ownerName)
+          ),
+          h('button',{onClick:function(e){e.stopPropagation();self.setState({showTodoPanel:true,todoTitle:'Follow up: '+i.title,todoSourceType:'Issue',todoSourceTitle:i.title,todoLinkedIssueId:i.id});},style:{fontSize:11,padding:'4px 10px',borderRadius:6,border:'1px solid #e5e7eb',background:'#fff',color:'#374151',cursor:'pointer',fontFamily:'inherit',flexShrink:0}},'+ To-do'),
+          h('svg',{viewBox:'0 0 16 16',fill:'none',stroke:'#9ca3af',strokeWidth:'1.5',style:{width:14,height:14,flexShrink:0,transform:isExp?'rotate(180deg)':'none',transition:'transform .15s'}},h('path',{d:'M4 6l4 4 4-4'}))
+        ),
+        isExp && h('div',{style:{borderTop:'1px solid #f0f0f0',padding:'14px',display:'flex',flexDirection:'column',gap:12}},
+          i.description
+            ? h('div',{style:{fontSize:13,color:'#6b7280',lineHeight:1.6,padding:'10px 12px',background:'#f9fafb',borderRadius:8,borderLeft:'3px solid #e5e7eb',minHeight:40},dangerouslySetInnerHTML:{__html:i.description}})
+            : h('div',{style:{fontSize:13,color:'#6b7280',lineHeight:1.6,padding:'10px 12px',background:'#f9fafb',borderRadius:8,borderLeft:'3px solid #e5e7eb',minHeight:40}},h('span',{style:{color:'#d1d5db',fontStyle:'italic'}},'No description \u2014 add context in the Issues list')),
+          h('div',{style:{display:'flex',gap:8,flexWrap:'wrap'}},
+            h('button',{onClick:function(){self._setIssueStatus(i,'Solved');},style:{fontSize:12,padding:'7px 16px',borderRadius:7,border:'none',background:'#ccfbf1',color:'#0f766e',cursor:'pointer',fontWeight:700,fontFamily:'inherit'}},'\u2713 Solved'),
+            h('button',{onClick:function(){self.setState({showTodoPanel:true,todoTitle:'Follow up: '+i.title,todoSourceType:'Issue',todoSourceTitle:i.title,todoLinkedIssueId:i.id});},style:{fontSize:12,padding:'7px 14px',borderRadius:7,border:'1px solid #e5e7eb',background:'#fff',color:'#374151',cursor:'pointer',fontFamily:'inherit'}},'+ Create to-do'),
+            h('button',{onClick:function(){self._setIssueStatus(i,'Dropped');},style:{fontSize:12,padding:'7px 12px',borderRadius:7,border:'none',background:'#fee2e2',color:'#991b1b',cursor:'pointer',fontFamily:'inherit'}},'Drop')
+          )
+        )
+      );
+    };
+
+    return h('div',{style:{display:'flex',flexDirection:'column',gap:8}},
+      solved.length>0 && h('div',{style:{fontSize:12,color:'#0f766e',fontWeight:600,padding:'4px 0'}},'\u2713 '+solved.length+' solved this meeting'),
+      h('div',{style:{display:'flex',alignItems:'center',gap:10}},
+        h('span',{style:{fontSize:11,fontWeight:600,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.5px'}},'Issues ('+open.length+' open)'),
+        idsPriorityNext>1 && h('button',{onClick:function(){self._clearPriorities();},style:{fontSize:10,padding:'2px 8px',borderRadius:4,border:'1px solid #e5e7eb',background:'#fff',color:'#9ca3af',cursor:'pointer',fontFamily:'inherit'}},'Clear 1-2-3')
+      ),
+      open.map(issueRow),
+      open.length===0 && h('div',{style:{padding:'24px',textAlign:'center',color:'#9ca3af',fontSize:13,background:'#f9fafb',borderRadius:10,border:'1px dashed #e5e7eb'}},'All issues solved!'),
+      h('div',{style:{display:'flex',gap:8,marginTop:4}},
+        h('input',{type:'text',placeholder:'Add issue to discuss...',value:newIssueTitle,onChange:function(e){self.setState({newIssueTitle:e.target.value});},onKeyDown:function(e){if(e.key==='Enter')self._addQuickIssue();},style:{flex:1,fontFamily:'inherit',fontSize:13,padding:'8px 12px',borderRadius:8,border:'1px solid #e5e7eb',outline:'none',color:'#111827'}}),
+        h('button',{onClick:function(){self._addQuickIssue();},disabled:!newIssueTitle.trim()||addingIssue,style:{fontSize:13,padding:'8px 14px',borderRadius:8,border:'none',background:newIssueTitle.trim()?'#0D2D3A':'#d1d5db',color:'#fff',cursor:newIssueTitle.trim()?'pointer':'default',fontWeight:600,fontFamily:'inherit'}},addingIssue?'...':'+')
+      )
+    );
+  };
+
+  NdlRunner.prototype._renderConclude = function() {
+    var self = this;
+    var st = this.state;
+    if (st.meetingSent) return h('div',{style:{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:48,gap:16,textAlign:'center'}},
+      h('div',{style:{fontSize:36}},'\uD83C\uDFC1'),
+      h('div',{style:{fontSize:20,fontWeight:700,color:'#111827'}},'Meeting complete!'),
+      h('div',{style:{fontSize:13,color:'#6b7280',maxWidth:360}},'Recap email sent to all meeting members.')
+    );
+    var todayTodos = st.todos.filter(function(t){return t.createdDate===todayISO();});
+    var offTrack = st.metrics.filter(function(m){return m.recentValues.length>0&&m.recentValues[0].onTrack==='No';});
+    var cards = [
+      {label:'Issues solved',val:String(st.solvedThisMeeting.length),bg:'#ccfbf1',color:'#0f766e'},
+      {label:'Still open',val:String(st.issues.filter(function(i){return i.issueStatus==='Open'&&st.solvedThisMeeting.indexOf(i.id)===-1;}).length),bg:'#fee2e2',color:'#991b1b'},
+      {label:'Rocks on track',val:st.rocks.filter(function(r){return r.rockStatus==='On Track';}).length+'/'+st.rocks.length,bg:'#f0faf8',color:'#0f766e'},
+      {label:'Total time',val:fmtSecs(st.elapsedSeconds),bg:'#f3f4f6',color:'#374151'}
+    ];
+    return h('div',{style:{display:'flex',gap:16}},
+      h('div',{style:{flex:1,display:'flex',flexDirection:'column',gap:12}},
+        h('div',{style:{fontSize:12,fontWeight:600,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.5px'}},'Meeting summary'),
+        h('div',{style:{display:'flex',gap:10,flexWrap:'wrap'}},
+          cards.map(function(s){ return h('div',{key:s.label,style:{flex:1,minWidth:100,background:s.bg,borderRadius:10,padding:'12px 14px'}},
+            h('div',{style:{fontSize:11,color:s.color,fontWeight:600,opacity:.8}},s.label),
+            h('div',{style:{fontSize:20,fontWeight:700,color:s.color}},s.val)
+          ); })
+        ),
+        offTrack.length>0 && h('div',{style:{background:'#fff',border:'1px solid #f0f0f0',borderRadius:10,padding:'12px 14px'}},
+          h('div',{style:{fontSize:11,fontWeight:600,color:'#991b1b',textTransform:'uppercase',letterSpacing:'.5px',marginBottom:8}},'Metrics needing attention'),
+          offTrack.map(function(m){ return h('div',{key:m.id,style:{fontSize:13,color:'#374151',padding:'3px 0'}},'\u2022 '+m.title); })
+        )
+      ),
+      h('div',{style:{flex:1,display:'flex',flexDirection:'column',gap:12}},
+        h('div',{style:{fontSize:12,fontWeight:600,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.5px'}},'To-dos created today ('+todayTodos.length+')'),
+        todayTodos.length===0
+          ? h('div',{style:{fontSize:13,color:'#9ca3af',fontStyle:'italic'}},'No to-dos created this meeting.')
+          : h('div',{style:{display:'flex',flexDirection:'column',gap:6}},
+              todayTodos.map(function(t){ return h('div',{key:t.id,style:{display:'flex',alignItems:'center',gap:8,padding:'8px 12px',background:'#fff',border:'1px solid #f0f0f0',borderRadius:8}},
+                h(Av,{name:t.ownerName,size:20,email:t.ownerEmail}),
+                h('span',{style:{flex:1,fontSize:13,color:'#374151'}},t.title),
+                h('span',{style:{fontSize:11,color:'#9ca3af'}},fmtDate(t.dueDate))
+              ); })
+            ),
+        h('button',{onClick:function(){self._endMeeting();},disabled:st.endingMeeting,style:{marginTop:8,padding:'12px',borderRadius:10,border:'none',background:st.endingMeeting?'#d1d5db':'#0D2D3A',color:'#fff',fontSize:14,fontWeight:700,cursor:st.endingMeeting?'default':'pointer',fontFamily:'inherit'}},st.endingMeeting?'Sending recap...:':'\uD83C\uDFC1 End meeting & send recap')
+      )
+    );
+  };
+
+  NdlRunner.prototype._renderTodoPanel = function() {
+    var self = this;
+    var st = this.state;
+    var inp = function(extra) { return Object.assign({fontFamily:'inherit',fontSize:13,padding:'8px 12px',borderRadius:8,border:'1px solid #e5e7eb',color:'#111827',outline:'none'},extra||{}); };
+    var field = function(label, child) {
+      return h('div',{style:{display:'flex',flexDirection:'column',gap:5}},
+        h('label',{style:{fontSize:11,fontWeight:600,color:'#6b7280',textTransform:'uppercase',letterSpacing:'.5px'}},label),
+        child
+      );
+    };
+
+    return h('div',{style:{position:'fixed',top:0,right:0,width:360,height:'100vh',background:'#fff',boxShadow:'-4px 0 24px rgba(0,0,0,.12)',display:'flex',flexDirection:'column',zIndex:10000}},
+      h('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'18px 20px',borderBottom:'1px solid #f0f0f0'}},
+        h('span',{style:{fontSize:15,fontWeight:700,color:'#111827'}},'Add to-do'),
+        h('button',{onClick:function(){self.setState({showTodoPanel:false,todoTitle:'',todoDue:defaultDue(),todoLinkedIssueId:null});},style:{width:28,height:28,borderRadius:6,border:'1px solid #e5e7eb',background:'#fff',cursor:'pointer',color:'#6b7280',fontSize:14,fontFamily:'inherit'}},'\u2715')
+      ),
+      h('div',{style:{flex:1,overflowY:'auto',padding:20,display:'flex',flexDirection:'column',gap:16}},
+        field('To-do *', h('input',{type:'text',placeholder:'What needs to be done?',value:st.todoTitle,autoFocus:true,onChange:function(e){self.setState({todoTitle:e.target.value});},style:inp()})),
+        field('Due date', h('input',{type:'date',value:st.todoDue,onChange:function(e){self.setState({todoDue:e.target.value});},style:inp()})),
+        field('Meeting', h('select',{value:st.todoMeeting,onChange:function(e){self.setState({todoMeeting:e.target.value});},style:inp({background:'#fff'})},
+          CONFIG.meetings.map(function(m){ return h('option',{key:m,value:m},m.replace('NDL - ','')); })
+        )),
+        field('Assign to',
+          st.todoAssigneeLogin
+            ? h('div',{style:{display:'flex',alignItems:'center',gap:8,padding:'8px 12px',borderRadius:8,border:'1px solid #e5e7eb',background:'#f9fafb'}},
+                h(Av,{name:st.todoAssigneeName,size:22}),
+                h('span',{style:{fontSize:13,color:'#111827',flex:1}},st.todoAssigneeName),
+                h('button',{onClick:function(){self.setState({todoAssigneeLogin:'',todoAssigneeName:'',todoAssigneeSearch:''});},style:{border:'none',background:'none',cursor:'pointer',color:'#9ca3af',fontSize:14,padding:0}},'\u2715')
+              )
+            : h('div',{style:{position:'relative'}},
+                h('input',{type:'text',placeholder:'Search or leave blank for yourself',value:st.todoAssigneeSearch,onChange:function(e){self.setState({todoAssigneeSearch:e.target.value});self._searchTodoAssignee(e.target.value);},style:Object.assign({},inp(),{width:'100%',boxSizing:'border-box'})}),
+                st.todoAssigneeSuggestions.length>0 && h('div',{style:{position:'absolute',top:'100%',left:0,right:0,background:'#fff',border:'1px solid #e5e7eb',borderRadius:8,boxShadow:'0 4px 16px rgba(0,0,0,.1)',zIndex:100,overflow:'hidden'}},
+                  st.todoAssigneeSuggestions.map(function(u){ return h('div',{key:u.email,onClick:function(){self.setState({todoAssigneeId:u.id,todoAssigneeLogin:u.loginName||'',todoAssigneeName:u.name,todoAssigneeSearch:'',todoAssigneeSuggestions:[]});},style:{display:'flex',alignItems:'center',gap:10,padding:'9px 12px',cursor:'pointer',borderBottom:'1px solid #f3f4f6'}},
+                    h(Av,{name:u.name,size:24}),
+                    h('div',null,
+                      h('div',{style:{fontSize:13,color:'#111827',fontWeight:500}},u.name),
+                      h('div',{style:{fontSize:11,color:'#9ca3af'}},u.email)
+                    )
+                  ); })
+                )
+              )
+        ),
+        field('Source', h('select',{value:st.todoSourceType,onChange:function(e){self.setState({todoSourceType:e.target.value});},style:inp({background:'#fff'})},
+          ['Meeting','Issue','Rock','Personal'].map(function(t){ return h('option',{key:t,value:t},t); })
+        ))
+      ),
+      h('div',{style:{padding:'16px 20px',borderTop:'1px solid #f0f0f0',display:'flex',gap:8}},
+        h('button',{onClick:function(){self.setState({showTodoPanel:false,todoTitle:'',todoDue:defaultDue(),todoLinkedIssueId:null});},style:{fontSize:13,padding:'9px 16px',borderRadius:8,border:'1px solid #e5e7eb',background:'#fff',color:'#374151',cursor:'pointer',fontWeight:500,fontFamily:'inherit'}},'Cancel'),
+        h('button',{onClick:function(){self._submitTodo();},disabled:!st.todoTitle.trim()||st.todoSaving,style:{flex:1,fontSize:13,padding:9,borderRadius:8,border:'none',background:st.todoTitle.trim()?'#0D2D3A':'#d1d5db',color:'#fff',cursor:st.todoTitle.trim()?'pointer':'default',fontWeight:600,fontFamily:'inherit'}},st.todoSaving?'Saving...':'Add to-do')
+      )
+    );
+  };
+
+  // ╔════════════════════════════════════════════════════════════════════════════╗
+  // ║  MAIN RENDER                                                              ║
+  // ╚════════════════════════════════════════════════════════════════════════════╝
+  NdlRunner.prototype.render = function() {
+    var self = this;
+    var st = this.state;
+    var sectionIdx = SECTIONS.findIndex(function(s){return s.id===st.currentSection;});
+    var secRemaining = st.durations[st.currentSection] - st.sectionElapsed[st.currentSection];
+    var overtime = secRemaining < 0;
+    var totalMins = 0;
+    SECTIONS.forEach(function(s){ totalMins += st.durations[s.id]; });
+    totalMins = totalMins / 60;
+
+    return h('div',{style:{fontFamily:"'DM Sans',-apple-system,BlinkMacSystemFont,sans-serif",background:'#f4f5f7',display:'flex',height:'100vh',boxSizing:'border-box',overflow:'hidden'}},
+
+      // ── Sidebar ──
+      h('div',{style:{width:210,flexShrink:0,background:'#fff',borderRight:'1px solid #f0f0f0',display:'flex',flexDirection:'column',height:'100%'}},
+        h('div',{style:{padding:'16px 14px 10px',borderBottom:'1px solid #f0f0f0'}},
+          h('div',{style:{fontSize:11,fontWeight:600,color:'#9ca3af',textTransform:'uppercase',letterSpacing:'.5px'}},'L10 Meeting'),
+          h('select',{value:st.meetingName,onChange:function(e){self._switchMeeting(e.target.value);},style:{fontSize:13,fontWeight:700,color:'#111827',marginTop:2,border:'none',background:'transparent',fontFamily:'inherit',cursor:'pointer',width:'100%',outline:'none',padding:'2px 0'}},
+            CONFIG.meetings.map(function(m){ return h('option',{key:m,value:m},m.replace('NDL - ','')); })
+          )
+        ),
+        SECTIONS.map(function(s,i) {
+          var done = i < sectionIdx;
+          var active = s.id === st.currentSection;
+          var mins = Math.round(st.durations[s.id]/60);
+          return h('div',{key:s.id,style:{display:'flex',alignItems:'center',gap:8,padding:'9px 14px',cursor:'pointer',borderLeft:active?'2px solid #0f766e':'2px solid transparent',background:active?'#f0faf8':'transparent'},onClick:function(){self._goToSection(s.id);}},
+            h('div',{style:{width:15,height:15,borderRadius:'50%',flexShrink:0,border:done?'none':active?'2px solid #0f766e':'1.5px solid #d1d5db',background:done?'#0D2D3A':'transparent',display:'flex',alignItems:'center',justifyContent:'center'}},
+              done && h('svg',{viewBox:'0 0 10 10',fill:'none',style:{width:8,height:8}},h('path',{d:'M2 5l2.5 2.5L8 3',stroke:'#fff',strokeWidth:'1.8',strokeLinecap:'round',strokeLinejoin:'round'}))
+            ),
+            h('span',{style:{flex:1,fontSize:13,fontWeight:active?600:400,color:active?'#0f766e':done?'#9ca3af':'#374151',textDecoration:done?'line-through':'none'}},s.label),
+            st.editingDur===s.id
+              ? h('input',{type:'number',value:st.durInput,autoFocus:true,onChange:function(e){self.setState({durInput:e.target.value});},onBlur:function(){var v=parseInt(st.durInput);if(!isNaN(v)&&v>0){var nd=Object.assign({},st.durations);nd[s.id]=v*60;self.setState({durations:nd,editingDur:null});}else self.setState({editingDur:null});},onKeyDown:function(e){if(e.key==='Enter')e.target.blur();if(e.key==='Escape')self.setState({editingDur:null});},style:{width:34,fontSize:11,padding:'2px 4px',borderRadius:4,border:'1px solid #0f766e',outline:'none',textAlign:'right',fontFamily:'inherit'}})
+              : h('span',{onClick:function(e){e.stopPropagation();self.setState({editingDur:s.id,durInput:String(mins)});},style:{fontSize:11,color:'#9ca3af',cursor:'text',paddingBottom:'1px',borderBottom:'1px dashed transparent'},title:'Click to edit'},mins+'m')
+          );
+        }),
+        h('div',{style:{padding:'10px 14px',borderTop:'1px solid #f0f0f0',marginTop:'auto'}},
+          h('div',{style:{fontSize:11,color:'#9ca3af'}},'Total time'),
+          h('div',{style:{fontSize:14,fontWeight:700,color:'#111827'}},(Math.floor(totalMins/60)>0?Math.floor(totalMins/60)+'h ':'') + Math.round(totalMins%60)+'m')
+        )
+      ),
+
+      // ── Main ──
+      h('div',{style:{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}},
+
+        // ── Header bar ──
+        h('div',{style:{display:'flex',alignItems:'center',gap:10,padding:'8px 16px',background:'#fff',borderBottom:'1px solid #f0f0f0',flexShrink:0}},
+          h('div',{style:{display:'flex',flexDirection:'column',alignItems:'center',marginRight:4}},
+            h('div',{style:{fontSize:10,color:'#9ca3af',fontWeight:600,textTransform:'uppercase',letterSpacing:'.4px'}},'Elapsed'),
+            h('div',{style:{fontSize:15,fontWeight:700,color:'#374151',fontVariantNumeric:'tabular-nums'}},fmtSecs(st.elapsedSeconds))
+          ),
+          h('div',{style:{display:'flex',flexDirection:'column',alignItems:'center'}},
+            h('div',{style:{fontSize:10,color:'#9ca3af',fontWeight:600,textTransform:'uppercase',letterSpacing:'.4px'}},'Section'),
+            h('div',{className:overtime?'ndl-ot':undefined,style:{fontSize:20,fontWeight:700,color:overtime?'#dc2626':'#111827',fontVariantNumeric:'tabular-nums',padding:overtime?'0 6px':'0'}},fmtSecs(secRemaining))
+          ),
+          h('div',{style:{flex:1,height:5,background:'#f3f4f6',borderRadius:3,overflow:'hidden',margin:'0 8px'}},
+            h('div',{style:{height:'100%',width:Math.max(0,Math.min(100,(secRemaining/st.durations[st.currentSection])*100))+'%',background:overtime?'#dc2626':'#0f766e',borderRadius:3,transition:'width .5s linear'}})
+          ),
+          h('button',{onClick:function(){if(sectionIdx>0)self._goToSection(SECTIONS[sectionIdx-1].id);},disabled:sectionIdx===0,style:{fontSize:12,padding:'6px 10px',borderRadius:7,border:'1px solid #e5e7eb',background:'#fff',color:'#374151',cursor:sectionIdx===0?'default':'pointer',opacity:sectionIdx===0?0.4:1,fontFamily:'inherit'}},'\u2190 Prev'),
+          h('button',{onClick:function(){st.isRunning?self._pauseTimer():self._startTimer();},style:{fontSize:13,padding:'7px 16px',borderRadius:7,border:'none',background:st.isRunning?'#374151':'#0D2D3A',color:'#fff',cursor:'pointer',fontWeight:600,fontFamily:'inherit',minWidth:78}},st.isRunning?'\u23F8 Pause':'\u25B6 Start'),
+          h('button',{onClick:function(){if(sectionIdx<SECTIONS.length-1)self._goToSection(SECTIONS[sectionIdx+1].id);},disabled:sectionIdx===SECTIONS.length-1,style:{fontSize:12,padding:'6px 10px',borderRadius:7,border:'1px solid #e5e7eb',background:'#fff',color:'#374151',cursor:sectionIdx===SECTIONS.length-1?'default':'pointer',opacity:sectionIdx===SECTIONS.length-1?0.4:1,fontFamily:'inherit'}},'Next \u2192'),
+          h('div',{style:{fontSize:12,fontWeight:600,color:'#6b7280',padding:'5px 10px',background:'#f3f4f6',borderRadius:7,whiteSpace:'nowrap'}},(sectionIdx+1)+'/'+SECTIONS.length+' \u2014 '+SECTIONS[sectionIdx].label),
+          h('button',{onClick:function(){self.setState({showTodoPanel:true,todoTitle:'',todoDue:defaultDue(),todoLinkedIssueId:null,todoSourceType:'Meeting'});},style:{fontSize:12,padding:'6px 12px',borderRadius:7,border:'1px solid #0f766e',background:'#f0faf8',color:'#0f766e',cursor:'pointer',fontWeight:600,fontFamily:'inherit',whiteSpace:'nowrap'}},'+ To-do')
+        ),
+
+        // ── Section content ──
+        h('div',{style:{flex:1,overflowY:'auto',padding:18}},
+          st.loading
+            ? h('div',{style:{padding:40,textAlign:'center',color:'#6b7280'}},'Loading...')
+            : st.currentSection==='segue' ? this._renderSegue()
+            : st.currentSection==='scorecard' ? this._renderScorecard()
+            : st.currentSection==='news' ? this._renderNews()
+            : st.currentSection==='rocks' ? this._renderRocks()
+            : st.currentSection==='todos' ? this._renderTodos()
+            : st.currentSection==='ids' ? this._renderIDS()
+            : this._renderConclude()
+        )
+      ),
+
+      // ── Slide-in To-Do panel ──
+      st.showTodoPanel && this._renderTodoPanel()
+    );
+  };
+
+  return NdlRunner;
+})(React.Component);
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  LOGIN SCREEN                                                               ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+function LoginScreen(props) {
+  var _a = React.useState(false), loading = _a[0], setLoading = _a[1];
+  var _b = React.useState(''), error = _b[0], setError = _b[1];
+
+  function handleLogin() {
+    setLoading(true);
+    setError('');
+    login().then(function() {
+      props.onLoggedIn();
+    }).catch(function(e) {
+      setError(e.message || 'Login failed. Check your Azure AD app registration.');
+      setLoading(false);
+    });
+  }
+
+  return h('div',{style:{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100vh',gap:20,fontFamily:"'DM Sans',-apple-system,sans-serif"}},
+    h('div',{style:{width:64,height:64,borderRadius:16,background:'#1a2b3c',display:'flex',alignItems:'center',justifyContent:'center',fontSize:24,fontWeight:700,color:'#48bfbe'}},'L10'),
+    h('div',{style:{fontSize:22,fontWeight:700,color:'#111827'}},'L10 Meeting Runner'),
+    h('div',{style:{fontSize:14,color:'#6b7280',maxWidth:360,textAlign:'center'}},'Sign in with your Microsoft 365 account to access meeting data.'),
+    h('button',{onClick:handleLogin,disabled:loading,style:{fontSize:14,padding:'12px 32px',borderRadius:8,border:'none',background:'#0D2D3A',color:'#fff',cursor:loading?'default':'pointer',fontWeight:600,fontFamily:'inherit'}},loading?'Signing in...':'Sign in with Microsoft'),
+    error && h('div',{style:{fontSize:13,color:'#dc2626',maxWidth:360,textAlign:'center',padding:'10px 16px',background:'#fee2e2',borderRadius:8}},error)
+  );
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  APP ROOT                                                                   ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+function App() {
+  var _a = React.useState(false), ready = _a[0], setReady = _a[1];
+  var _b = React.useState(false), loggedIn = _b[0], setLoggedIn = _b[1];
+  var _c = React.useState(false), isConfig = _c[0], setIsConfig = _c[1];
+
+  React.useEffect(function() {
+    async function init() {
+      // Initialize Teams first
+      var ctx = await initTeams();
+      if (ctx && ctx.page && ctx.page.frameContext === 'settings') {
+        setIsConfig(true);
+        setReady(true);
+        return;
+      }
+
+      // Initialize MSAL
+      var account = await initAuth();
+      if (account) {
+        // Try to silently get a token to verify the session is valid
+        try {
+          await getToken();
+          setLoggedIn(true);
+        } catch(e) {
+          // Token expired or invalid — need interactive login
+        }
+      }
+      setReady(true);
+    }
+    init();
+  }, []);
+
+  if (!ready) return h('div',{style:{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',fontFamily:"'DM Sans',sans-serif",color:'#6b7280'}},'Initializing...');
+
+  // Teams config screen
+  if (isConfig) return h('div',{style:{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100vh',gap:16,fontFamily:"'DM Sans',sans-serif"}},
+    h('div',{style:{width:48,height:48,borderRadius:12,background:'#1a2b3c',display:'flex',alignItems:'center',justifyContent:'center',fontSize:18,fontWeight:700,color:'#48bfbe'}},'L10'),
+    h('div',{style:{fontSize:18,fontWeight:700,color:'#111827'}},'L10 Meeting Runner'),
+    h('div',{style:{fontSize:14,color:'#6b7280',textAlign:'center',maxWidth:320}},'Click Save to add the L10 Meeting Runner to this meeting. You can switch between teams from within the app.'),
+    h('div',{style:{fontSize:13,color:'#0f766e',fontWeight:600,background:'#f0faf8',padding:'8px 16px',borderRadius:8}},'\u2713 Ready to save')
+  );
+
+  if (!loggedIn) return h(LoginScreen, { onLoggedIn: function(){ setLoggedIn(true); } });
+
+  return h(NdlRunner, { initialMeeting: CONFIG.meetings[0] });
+}
+
+// Mount
+ReactDOM.render(h(App), document.getElementById('r
