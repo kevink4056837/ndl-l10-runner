@@ -106,11 +106,9 @@ async function getToken() {
     var resp = await msalInstance.acquireTokenSilent(tokenRequest);
     return resp.accessToken;
   } catch (e) {
-    // Silent failed — try popup
+    // Silent failed — try redirect (popups blocked in Teams)
     try {
-      var resp = await msalInstance.acquireTokenPopup(tokenRequest);
-      currentAccount = resp.account;
-      return resp.accessToken;
+      await msalInstance.acquireTokenRedirect(tokenRequest);
     } catch (e2) {
       console.error('Auth failed:', e2);
       throw e2;
@@ -120,11 +118,10 @@ async function getToken() {
 
 async function login() {
   try {
-    var resp = await msalInstance.loginPopup({
+    await msalInstance.loginRedirect({
       scopes: [CONFIG.siteUrl + '/.default']
     });
-    currentAccount = resp.account;
-    return currentAccount;
+    // Page will redirect — execution stops here
   } catch (e) {
     console.error('Login failed:', e);
     throw e;
@@ -1209,9 +1206,8 @@ function LoginScreen(props) {
   function handleLogin() {
     setLoading(true);
     setError('');
-    login().then(function() {
-      props.onLoggedIn();
-    }).catch(function(e) {
+    login().catch(function(e) {
+      // loginRedirect navigates away, so errors here mean something actually broke
       setError(e.message || 'Login failed. Check your Azure AD app registration.');
       setLoading(false);
     });
