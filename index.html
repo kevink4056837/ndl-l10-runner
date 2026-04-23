@@ -247,7 +247,11 @@ var teamsContext = null;
 
 async function initTeams() {
   try {
-    await microsoftTeams.app.initialize();
+    // Race against a 3-second timeout — Teams SDK hangs forever outside Teams
+    await Promise.race([
+      microsoftTeams.app.initialize(),
+      new Promise(function(_, reject) { setTimeout(function(){ reject(new Error('Not in Teams')); }, 3000); })
+    ]);
     inTeams = true;
     teamsContext = await microsoftTeams.app.getContext();
 
