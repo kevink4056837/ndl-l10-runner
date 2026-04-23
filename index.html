@@ -6,8 +6,6 @@
 <title>L10 Meeting Runner</title>
 <!-- Teams JS SDK -->
 <script src="https://res.cdn.office.net/teams-js/2.24.0/js/MicrosoftTeams.min.js"></script>
-<!-- MSAL Browser -->
-<script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
 <!-- React 17 (matches SPFx 1.18.2) -->
 <script crossorigin src="https://unpkg.com/react@17/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@17/umd/react-dom.production.min.js"></script>
@@ -70,17 +68,8 @@ var CONFIG = {
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║  AUTH — MSAL setup                                                          ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
-var msalInstance = null;
-var currentAccount = null;
-
-var msalConfig = {
-  auth: {
-    clientId: CONFIG.clientId,
-    authority: 'https://login.microsoftonline.com/' + CONFIG.tenantId,
-    redirectUri: 'https://kevink4056837.github.io/ndl-l10-runner/index.html'
-  },
-  cache: { cacheLocation: 'sessionStorage', storeAuthStateInCookie: true }
-};
+// MSAL is only used in auth.html (the Teams auth popup)
+// Main page just stores/retrieves the access token
 
 // Cached access token — persisted in localStorage
 var _cachedToken = null;
@@ -101,20 +90,9 @@ function _loadToken() {
 }
 
 async function initAuth() {
-  // In Teams, we use the Teams auth popup — no MSAL on the main page
-  // Try to get a token right away via Teams SSO or cached MSAL
-  try {
-    msalInstance = new msal.PublicClientApplication(msalConfig);
-    await msalInstance.initialize();
-    var resp = await msalInstance.handleRedirectPromise();
-    if (resp) { currentAccount = resp.account; }
-    var accounts = msalInstance.getAllAccounts();
-    if (accounts.length > 0) currentAccount = accounts[0];
-  } catch(e) {
-    console.warn('MSAL init (non-critical):', e);
-    msalInstance = null;
-  }
-  return currentAccount;
+  // Main page doesn't use MSAL — auth is handled via Teams popup (auth.html)
+  // Just check if we have a stored token
+  return _loadToken();
 }
 
 async function getToken() {
@@ -125,19 +103,6 @@ async function getToken() {
 
   // Check localStorage
   if (_loadToken()) return _cachedToken;
-
-  // Try MSAL silent first
-  if (msalInstance && currentAccount) {
-    try {
-      var resp = await msalInstance.acquireTokenSilent({
-        scopes: [CONFIG.siteUrl + '/.default'],
-        account: currentAccount
-      });
-      var exp = resp.expiresOn ? resp.expiresOn.getTime() : (Date.now() + 3600000);
-      _saveToken(resp.accessToken, exp);
-      return _cachedToken;
-    } catch(e) { /* fall through to Teams auth */ }
-  }
 
   // Use Teams auth popup to get a fresh token
   if (inTeams) {
@@ -151,7 +116,7 @@ async function getToken() {
       return _cachedToken;
     } catch(e) {
       console.error('Teams auth failed:', e);
-      throw new Error('Authentication failed. Please try again.');
+      throw new Error('Session expired. Please refresh and sign in again.');
     }
   }
 
@@ -159,21 +124,14 @@ async function getToken() {
 }
 
 async function login() {
-  // Use Teams auth popup
-  if (inTeams) {
-    var token = await microsoftTeams.authentication.authenticate({
-      url: window.location.origin + '/ndl-l10-runner/auth.html',
-      width: 600,
-      height: 535
-    });
-    _saveToken(token, Date.now() + 3600000);
-    return true;
-  }
-  // Outside Teams — redirect
-  if (msalInstance) {
-    await msalInstance.loginRedirect({ scopes: [CONFIG.siteUrl + '/.default'] });
-  }
-  throw new Error('Not in Teams and MSAL unavailable.');
+  if (!inTeams) throw new Error('Open this app inside a Teams meeting.');
+  var token = await microsoftTeams.authentication.authenticate({
+    url: window.location.origin + '/ndl-l10-runner/auth.html',
+    width: 600,
+    height: 535
+  });
+  _saveToken(token, Date.now() + 3600000);
+  return true;
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -1292,20 +1250,9 @@ function App() {
       } catch(e) { console.warn('Teams init skipped:', e); }
 
       try {
-        // Check for stored token first
+        // Check for stored token
         if (_loadToken()) {
           setLoggedIn(true);
-        } else {
-          // Initialize MSAL (may fail in Teams iframe — that's ok, we use Teams auth popup)
-          var account = await initAuth();
-          if (account) {
-            try {
-              await getToken();
-              setLoggedIn(true);
-            } catch(e) {
-              // Token expired or invalid — need interactive login
-            }
-          }
         }
       } catch(e) { console.warn('MSAL init error:', e); }
 
