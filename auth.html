@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<script src="https://res.cdn.office.net/teams-js/2.24.0/js/MicrosoftTeams.min.js"></script>
+<script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
+</head>
+<body>
+<p style="font-family:sans-serif;text-align:center;padding:40px;color:#6b7280">Signing in...</p>
+<script>
+var CONFIG = {
+  clientId: '72107559-538e-488e-985c-a62494837195',
+  tenantId: '5e8309ee-c8d0-4bc7-b5b8-5a37a4eb107b',
+  siteUrl: 'https://ndlhearthnh.sharepoint.com/sites/NDLHub'
+};
+
+(async function() {
+  try {
+    await microsoftTeams.app.initialize();
+
+    var msalApp = new msal.PublicClientApplication({
+      auth: {
+        clientId: CONFIG.clientId,
+        authority: 'https://login.microsoftonline.com/' + CONFIG.tenantId,
+        redirectUri: window.location.origin + '/ndl-l10-runner/auth.html'
+      },
+      cache: { cacheLocation: 'sessionStorage' }
+    });
+    await msalApp.initialize();
+
+    // Check if we're returning from a redirect
+    var resp = await msalApp.handleRedirectPromise();
+    if (resp && resp.accessToken) {
+      // Got the token — send it back to the main page
+      microsoftTeams.authentication.notifySuccess(resp.accessToken);
+      return;
+    }
+
+    // Not returning from redirect — start the login
+    await msalApp.acquireTokenRedirect({
+      scopes: [CONFIG.siteUrl + '/.default']
+    });
+  } catch (e) {
+    microsoftTeams.authentication.notifyFailure(e.message || 'Auth failed');
+  }
+})();
+</script>
+</body>
+</html>

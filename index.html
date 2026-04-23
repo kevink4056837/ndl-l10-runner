@@ -82,83 +82,98 @@ var msalConfig = {
   cache: { cacheLocation: 'sessionStorage', storeAuthStateInCookie: true }
 };
 
-async function initAuth(loginHint) {
-  msalInstance = new msal.PublicClientApplication(msalConfig);
-  await msalInstance.initialize();
+// Cached access token — persisted in localStorage
+var _cachedToken = null;
+var _tokenExpiry = 0;
 
-  // Handle redirect response (if returning from auth redirect)
-  var resp = await msalInstance.handleRedirectPromise();
-  if (resp) currentAccount = resp.account;
+function _saveToken(token, expiresMs) {
+  _cachedToken = token;
+  _tokenExpiry = expiresMs;
+  try { localStorage.setItem('ndl_l10_token', token); localStorage.setItem('ndl_l10_token_exp', String(expiresMs)); } catch(e) {}
+}
+function _loadToken() {
+  try {
+    var t = localStorage.getItem('ndl_l10_token');
+    var exp = parseInt(localStorage.getItem('ndl_l10_token_exp') || '0');
+    if (t && exp > Date.now() + 300000) { _cachedToken = t; _tokenExpiry = exp; return true; }
+  } catch(e) {}
+  return false;
+}
 
-  // Check for existing accounts
-  var accounts = msalInstance.getAllAccounts();
-  if (accounts.length > 0) currentAccount = accounts[0];
-
-  // If we have a login hint (from Teams) but no account, try SSO silent
-  if (!currentAccount && loginHint) {
-    try {
-      var ssoResp = await msalInstance.ssoSilent({
-        scopes: [CONFIG.siteUrl + '/.default'],
-        loginHint: loginHint
-      });
-      currentAccount = ssoResp.account;
-    } catch (e) {
-      console.warn('SSO silent failed:', e);
-    }
+async function initAuth() {
+  // In Teams, we use the Teams auth popup — no MSAL on the main page
+  // Try to get a token right away via Teams SSO or cached MSAL
+  try {
+    msalInstance = new msal.PublicClientApplication(msalConfig);
+    await msalInstance.initialize();
+    var resp = await msalInstance.handleRedirectPromise();
+    if (resp) { currentAccount = resp.account; }
+    var accounts = msalInstance.getAllAccounts();
+    if (accounts.length > 0) currentAccount = accounts[0];
+  } catch(e) {
+    console.warn('MSAL init (non-critical):', e);
+    msalInstance = null;
   }
-
   return currentAccount;
 }
 
 async function getToken() {
-  var tokenRequest = {
-    scopes: [CONFIG.siteUrl + '/.default'],
-    account: currentAccount
-  };
-  try {
-    var resp = await msalInstance.acquireTokenSilent(tokenRequest);
-    return resp.accessToken;
-  } catch (e) {
-    // Silent failed — try SSO silent with login hint as fallback
-    if (currentAccount) {
-      try {
-        var resp2 = await msalInstance.ssoSilent({
-          scopes: [CONFIG.siteUrl + '/.default'],
-          loginHint: currentAccount.username
-        });
-        currentAccount = resp2.account;
-        return resp2.accessToken;
-      } catch (e2) { /* fall through */ }
-    }
-    // Last resort — redirect
+  // Return cached token if still valid (5 min buffer)
+  if (_cachedToken && Date.now() < _tokenExpiry - 300000) {
+    return _cachedToken;
+  }
+
+  // Check localStorage
+  if (_loadToken()) return _cachedToken;
+
+  // Try MSAL silent first
+  if (msalInstance && currentAccount) {
     try {
-      await msalInstance.acquireTokenRedirect(tokenRequest);
-    } catch (e3) {
-      console.error('Auth failed:', e3);
-      throw e3;
+      var resp = await msalInstance.acquireTokenSilent({
+        scopes: [CONFIG.siteUrl + '/.default'],
+        account: currentAccount
+      });
+      var exp = resp.expiresOn ? resp.expiresOn.getTime() : (Date.now() + 3600000);
+      _saveToken(resp.accessToken, exp);
+      return _cachedToken;
+    } catch(e) { /* fall through to Teams auth */ }
+  }
+
+  // Use Teams auth popup to get a fresh token
+  if (inTeams) {
+    try {
+      var token = await microsoftTeams.authentication.authenticate({
+        url: window.location.origin + '/ndl-l10-runner/auth.html',
+        width: 600,
+        height: 535
+      });
+      _saveToken(token, Date.now() + 3600000);
+      return _cachedToken;
+    } catch(e) {
+      console.error('Teams auth failed:', e);
+      throw new Error('Authentication failed. Please try again.');
     }
   }
+
+  throw new Error('No authentication method available.');
 }
 
 async function login() {
-  // Try SSO silent first (works when user is already signed into M365)
-  try {
-    var resp = await msalInstance.ssoSilent({
-      scopes: [CONFIG.siteUrl + '/.default']
+  // Use Teams auth popup
+  if (inTeams) {
+    var token = await microsoftTeams.authentication.authenticate({
+      url: window.location.origin + '/ndl-l10-runner/auth.html',
+      width: 600,
+      height: 535
     });
-    currentAccount = resp.account;
-    return currentAccount;
-  } catch (e) {
-    // SSO failed — fall back to redirect
-    try {
-      await msalInstance.loginRedirect({
-        scopes: [CONFIG.siteUrl + '/.default']
-      });
-    } catch (e2) {
-      console.error('Login failed:', e2);
-      throw e2;
-    }
+    _saveToken(token, Date.now() + 3600000);
+    return true;
   }
+  // Outside Teams — redirect
+  if (msalInstance) {
+    await msalInstance.loginRedirect({ scopes: [CONFIG.siteUrl + '/.default'] });
+  }
+  throw new Error('Not in Teams and MSAL unavailable.');
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -1239,8 +1254,9 @@ function LoginScreen(props) {
   function handleLogin() {
     setLoading(true);
     setError('');
-    login().catch(function(e) {
-      // loginRedirect navigates away, so errors here mean something actually broke
+    login().then(function() {
+      props.onLoggedIn();
+    }).catch(function(e) {
       setError(e.message || 'Login failed. Check your Azure AD app registration.');
       setLoading(false);
     });
@@ -1276,20 +1292,19 @@ function App() {
       } catch(e) { console.warn('Teams init skipped:', e); }
 
       try {
-        // Get login hint from Teams context if available
-        var loginHint = null;
-        if (teamsContext && teamsContext.user) {
-          loginHint = teamsContext.user.userPrincipalName || teamsContext.user.loginHint;
-        }
-
-        // Initialize MSAL with Teams login hint for automatic SSO
-        var account = await initAuth(loginHint);
-        if (account) {
-          try {
-            await getToken();
-            setLoggedIn(true);
-          } catch(e) {
-            // Token expired or invalid — need interactive login
+        // Check for stored token first
+        if (_loadToken()) {
+          setLoggedIn(true);
+        } else {
+          // Initialize MSAL (may fail in Teams iframe — that's ok, we use Teams auth popup)
+          var account = await initAuth();
+          if (account) {
+            try {
+              await getToken();
+              setLoggedIn(true);
+            } catch(e) {
+              // Token expired or invalid — need interactive login
+            }
           }
         }
       } catch(e) { console.warn('MSAL init error:', e); }
