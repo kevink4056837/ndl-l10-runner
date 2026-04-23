@@ -38,7 +38,7 @@ var CONFIG = {
 
     // Not returning from redirect — start the login
     await msalApp.acquireTokenRedirect({
-      scopes: [CONFIG.siteUrl + '/.default']
+      scopes: ['https://ndlhearthnh.sharepoint.com/.default']
     });
   } catch (e) {
     microsoftTeams.authentication.notifyFailure(e.message || 'Auth failed');

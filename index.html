@@ -6,6 +6,8 @@
 <title>L10 Meeting Runner</title>
 <!-- Teams JS SDK -->
 <script src="https://res.cdn.office.net/teams-js/2.24.0/js/MicrosoftTeams.min.js"></script>
+<!-- MSAL Browser (for silent token acquisition) -->
+<script src="https://unpkg.com/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"></script>
 <!-- React 17 (matches SPFx 1.18.2) -->
 <script crossorigin src="https://unpkg.com/react@17/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@17/umd/react-dom.production.min.js"></script>
@@ -66,14 +68,17 @@ var CONFIG = {
 };
 
 // ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║  AUTH — MSAL setup                                                          ║
+// ║  AUTH — Teams SSO + MSAL silent                                             ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
-// MSAL is only used in auth.html (the Teams auth popup)
-// Main page just stores/retrieves the access token
+// Flow: Teams getAuthToken() → decode for login hint → MSAL ssoSilent for SP token
+// Zero clicks for the user. Falls back to Teams auth popup if silent fails.
 
-// Cached access token — persisted in localStorage
 var _cachedToken = null;
 var _tokenExpiry = 0;
+var _msalApp = null;
+
+// SharePoint resource scope — root domain, NOT the site URL
+var SP_SCOPE = 'https://ndlhearthnh.sharepoint.com/.default';
 
 function _saveToken(token, expiresMs) {
   _cachedToken = token;
@@ -89,23 +94,68 @@ function _loadToken() {
   return false;
 }
 
-async function initAuth() {
-  // Main page doesn't use MSAL — auth is handled via Teams popup (auth.html)
-  // Just check if we have a stored token
-  return _loadToken();
+// Decode JWT to get claims (no validation needed — just reading the payload)
+function _decodeJwt(token) {
+  try {
+    var parts = token.split('.');
+    var payload = JSON.parse(atob(parts[1].replace(/-/g,'+').replace(/_/g,'/')));
+    return payload;
+  } catch(e) { return {}; }
+}
+
+async function _initMsal() {
+  if (_msalApp) return _msalApp;
+  if (typeof msal === 'undefined') return null;
+  _msalApp = new msal.PublicClientApplication({
+    auth: {
+      clientId: CONFIG.clientId,
+      authority: 'https://login.microsoftonline.com/' + CONFIG.tenantId,
+      redirectUri: 'https://kevink4056837.github.io/ndl-l10-runner/index.html'
+    },
+    cache: { cacheLocation: 'localStorage' }
+  });
+  await _msalApp.initialize();
+  await _msalApp.handleRedirectPromise();
+  return _msalApp;
 }
 
 async function getToken() {
-  // Return cached token if still valid (5 min buffer)
-  if (_cachedToken && Date.now() < _tokenExpiry - 300000) {
-    return _cachedToken;
-  }
-
-  // Check localStorage
+  // 1. Return cached token if still valid
+  if (_cachedToken && Date.now() < _tokenExpiry - 300000) return _cachedToken;
   if (_loadToken()) return _cachedToken;
 
-  // Use Teams auth popup to get a fresh token
+  // 2. Try Teams SSO → MSAL ssoSilent (zero UI)
   if (inTeams) {
+    try {
+      // Get the Teams SSO token (seamless, no popup)
+      var ssoToken = await microsoftTeams.authentication.getAuthToken();
+      var claims = _decodeJwt(ssoToken);
+      var loginHint = claims.preferred_username || claims.upn || '';
+
+      // Use the login hint to silently get a SharePoint token via MSAL
+      var app = await _initMsal();
+      if (app && loginHint) {
+        try {
+          var resp = await app.ssoSilent({ scopes: [SP_SCOPE], loginHint: loginHint });
+          var exp = resp.expiresOn ? resp.expiresOn.getTime() : (Date.now() + 3600000);
+          _saveToken(resp.accessToken, exp);
+          return _cachedToken;
+        } catch(e) { console.warn('ssoSilent failed, trying acquireTokenSilent:', e); }
+
+        // Try acquireTokenSilent with any cached account
+        var accounts = app.getAllAccounts();
+        if (accounts.length > 0) {
+          try {
+            var resp2 = await app.acquireTokenSilent({ scopes: [SP_SCOPE], account: accounts[0] });
+            var exp2 = resp2.expiresOn ? resp2.expiresOn.getTime() : (Date.now() + 3600000);
+            _saveToken(resp2.accessToken, exp2);
+            return _cachedToken;
+          } catch(e) { console.warn('acquireTokenSilent failed:', e); }
+        }
+      }
+    } catch(e) { console.warn('Teams SSO silent path failed:', e); }
+
+    // 3. Fallback: Teams auth popup (one-time, then cached)
     try {
       var token = await microsoftTeams.authentication.authenticate({
         url: window.location.origin + '/ndl-l10-runner/auth.html',
@@ -115,22 +165,17 @@ async function getToken() {
       _saveToken(token, Date.now() + 3600000);
       return _cachedToken;
     } catch(e) {
-      console.error('Teams auth failed:', e);
-      throw new Error('Session expired. Please refresh and sign in again.');
+      console.error('Teams auth popup failed:', e);
+      throw new Error('Authentication failed. Please try again.');
     }
   }
 
-  throw new Error('No authentication method available.');
+  throw new Error('Open this app inside a Teams meeting.');
 }
 
 async function login() {
-  if (!inTeams) throw new Error('Open this app inside a Teams meeting.');
-  var token = await microsoftTeams.authentication.authenticate({
-    url: window.location.origin + '/ndl-l10-runner/auth.html',
-    width: 600,
-    height: 535
-  });
-  _saveToken(token, Date.now() + 3600000);
+  // Just call getToken — it handles the full auth chain
+  await getToken();
   return true;
 }
 
@@ -1250,9 +1295,12 @@ function App() {
       } catch(e) { console.warn('Teams init skipped:', e); }
 
       try {
-        // Check for stored token
-        if (_loadToken()) {
+        // Try to get a token automatically (SSO or cached)
+        try {
+          await getToken();
           setLoggedIn(true);
+        } catch(e) {
+          console.warn('Auto-auth failed, will show login:', e);
         }
       } catch(e) { console.warn('MSAL init error:', e); }
 
