@@ -82,7 +82,7 @@ var msalConfig = {
   cache: { cacheLocation: 'sessionStorage', storeAuthStateInCookie: true }
 };
 
-async function initAuth() {
+async function initAuth(loginHint) {
   msalInstance = new msal.PublicClientApplication(msalConfig);
   await msalInstance.initialize();
 
@@ -93,6 +93,19 @@ async function initAuth() {
   // Check for existing accounts
   var accounts = msalInstance.getAllAccounts();
   if (accounts.length > 0) currentAccount = accounts[0];
+
+  // If we have a login hint (from Teams) but no account, try SSO silent
+  if (!currentAccount && loginHint) {
+    try {
+      var ssoResp = await msalInstance.ssoSilent({
+        scopes: [CONFIG.siteUrl + '/.default'],
+        loginHint: loginHint
+      });
+      currentAccount = ssoResp.account;
+    } catch (e) {
+      console.warn('SSO silent failed:', e);
+    }
+  }
 
   return currentAccount;
 }
@@ -106,25 +119,45 @@ async function getToken() {
     var resp = await msalInstance.acquireTokenSilent(tokenRequest);
     return resp.accessToken;
   } catch (e) {
-    // Silent failed — try redirect (popups blocked in Teams)
+    // Silent failed — try SSO silent with login hint as fallback
+    if (currentAccount) {
+      try {
+        var resp2 = await msalInstance.ssoSilent({
+          scopes: [CONFIG.siteUrl + '/.default'],
+          loginHint: currentAccount.username
+        });
+        currentAccount = resp2.account;
+        return resp2.accessToken;
+      } catch (e2) { /* fall through */ }
+    }
+    // Last resort — redirect
     try {
       await msalInstance.acquireTokenRedirect(tokenRequest);
-    } catch (e2) {
-      console.error('Auth failed:', e2);
-      throw e2;
+    } catch (e3) {
+      console.error('Auth failed:', e3);
+      throw e3;
     }
   }
 }
 
 async function login() {
+  // Try SSO silent first (works when user is already signed into M365)
   try {
-    await msalInstance.loginRedirect({
+    var resp = await msalInstance.ssoSilent({
       scopes: [CONFIG.siteUrl + '/.default']
     });
-    // Page will redirect — execution stops here
+    currentAccount = resp.account;
+    return currentAccount;
   } catch (e) {
-    console.error('Login failed:', e);
-    throw e;
+    // SSO failed — fall back to redirect
+    try {
+      await msalInstance.loginRedirect({
+        scopes: [CONFIG.siteUrl + '/.default']
+      });
+    } catch (e2) {
+      console.error('Login failed:', e2);
+      throw e2;
+    }
   }
 }
 
@@ -1243,8 +1276,14 @@ function App() {
       } catch(e) { console.warn('Teams init skipped:', e); }
 
       try {
-        // Initialize MSAL
-        var account = await initAuth();
+        // Get login hint from Teams context if available
+        var loginHint = null;
+        if (teamsContext && teamsContext.user) {
+          loginHint = teamsContext.user.userPrincipalName || teamsContext.user.loginHint;
+        }
+
+        // Initialize MSAL with Teams login hint for automatic SSO
+        var account = await initAuth(loginHint);
         if (account) {
           try {
             await getToken();
